@@ -72,7 +72,8 @@ def _hs_allowed(hs6: str) -> bool:
 def _discover_files(year: int | None) -> list[Path]:
     if not BACI_DIR.is_dir():
         return []
-    paths = sorted(BACI_DIR.glob(BACI_GLOB))
+    # CEPII zips often unpack into a versioned subfolder; rglob finds nested CSVs.
+    paths = sorted(BACI_DIR.rglob(BACI_GLOB))
     if year is not None:
         needle = f"_Y{year}"
         paths = [p for p in paths if needle in p.name]

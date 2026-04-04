@@ -27,7 +27,7 @@ hormuz-supply-chain/
 ├── data/
 │   ├── baci/                        # BACI CSVs → load_baci.py → bilateral_trade
 │   ├── cepi/                        # ProTEE + GeoDep CSVs; optional WTFC/CHELEM zips (no loader)
-│   ├── jodi/                        # JODI CSV exports (gas/oil); loaders planned — see below
+│   ├── jodi/                        # JODI CSV exports (gas/oil); load_jodi.py → jodi_energy_observations
 │   ├── usgs/                        # MCS CSV + standardised per-country yearbook xlsx; loaders planned
 │   └── globalenergymonitor/         # GEM .xlsx trackers; GIS .zip bundles deferred (maps later)
 │
@@ -44,7 +44,8 @@ hormuz-supply-chain/
 │
 ├── loaders/                         # scripts that ingest manually downloaded files
 │   ├── load_baci.py                 # BACI: bilateral trade flows (HS6, 200 countries)
-│   └── load_cepi_beyond_baci.py     # CEPII ProTEE + GeoDep (elasticities & import-dependence)
+│   ├── load_cepi_beyond_baci.py     # CEPII ProTEE + GeoDep (elasticities & import-dependence)
+│   └── load_jodi.py                 # JODI oil/gas CSVs → jodi_energy_observations
 │
 ├── app/
 │   └── streamlit_app.py             # data explorer UI — reads from Supabase only
@@ -60,7 +61,7 @@ hormuz-supply-chain/
 |--------|----------|----------------|
 | `data/baci/` | CEPII BACI yearly CSVs | **`bilateral_trade`** via [`loaders/load_baci.py`](loaders/load_baci.py) |
 | `data/cepi/` | `ProTEE_0_1.csv`, `geodep_data.csv`; optional **WTFC_HS96** / **CHELEM** zips (large) | **`cepii_protee_hs6`**, **`cepii_geodep_import_dependence`** via [`loaders/load_cepi_beyond_baci.py`](loaders/load_cepi_beyond_baci.py). **WTFC/CHELEM zips:** no loader — deferred. |
-| `data/jodi/` | Flat **CSVs** (e.g. gas `STAGING_world_NewFormat.csv`, oil `primaryyear2026.csv` — same column layout); optional `jodi-oil-country-note.xlsx` (notes) | **Not loaded yet.** Planned: **`jodi_energy_observations`** + `load_jodi.py` (separate from EIA `energy_trade_flows`). |
+| `data/jodi/` | Flat **CSVs** (e.g. gas `STAGING_world_NewFormat.csv`, oil `primaryyear2026.csv` — same column layout); optional `jodi-oil-country-note.xlsx` (notes) | **`jodi_energy_observations`** via [`loaders/load_jodi.py`](loaders/load_jodi.py). Gas files often span **2009–present** (~18k rows/year at steady state); the loader defaults to **`data_year >= 2020`** to match BACI-style horizons — use **`--all-years`** or **`--min-year YYYY`** to change. |
 | `data/usgs/` | **`MCS2026_Commodities_Data.csv`** (country × mineral × statistic — use for top producers, Gulf filters); standardised **`myb3-*.xlsx`** per country (**facility names + owners**) | **Not loaded yet.** Planned: **`usgs_mineral_statistics`**, **`usgs_country_mineral_facilities`** + `load_usgs.py`. MCS needs **`latin-1`** (or `cp1252`) when reading CSV. |
 | `data/globalenergymonitor/` | **`.xlsx`** trackers (LNG, GOGPT, pipelines summaries, etc.) | **Not loaded yet.** Planned: tabular GEM loader(s). **`.zip` GIS** (`.geojson`/`.gpkg`): **out of scope for first pass** — keep files for a later PostGIS / map phase. |
 
@@ -585,6 +586,21 @@ uv run python loaders/load_cepi_beyond_baci.py all
 
 Optional: set `GEODEP_HS_PREFIXES` in the script (same idea as `HS_CODES` in `load_baci.py`) to load only products under selected HS prefixes and shrink runtime.
 
+### `load_jodi.py` — JODI oil and gas CSVs
+
+**Source:** JODI — manual CSV export (same column layout for oil and gas products).  
+**Writes to:** `jodi_energy_observations`  
+**Semantics:** One row per reporter (`REF_AREA` ISO2), month, `ENERGY_PRODUCT`, `FLOW_BREAKDOWN`, and `UNIT_MEASURE`. Numeric values go to `obs_value`; missing or confidential markers stay in `obs_value_raw`. `country` is ISO3 mapped from `REF_AREA` for joins to the rest of the schema.
+
+**Year filter:** The gas staging file can cover **~2009–present** (~300k+ rows full history). By default the loader keeps **`data_year >= 2020`** (`MIN_DATA_YEAR` in the script). Use **`--all-years`** for the full file, or **`--min-year 2015`** (etc.) for a custom floor.
+
+```bash
+uv run python loaders/load_jodi.py
+uv run python loaders/load_jodi.py --file STAGING_world_NewFormat.csv
+uv run python loaders/load_jodi.py --all-years
+uv run python loaders/load_jodi.py --min-year 2018
+```
+
 **Known limitation:** Large GeoDep uploads may hit transient HTTP/TLS errors; re-run — upserts are idempotent.
 
 ---
@@ -627,6 +643,7 @@ uv run streamlit run app/streamlit_app.py
 |---|---|
 | `load_baci.py` | Annually, when CEPII releases new year |
 | `load_cepi_beyond_baci.py` | When CEPII refreshes ProTEE / GeoDep CSVs |
+| `load_jodi.py` | When you refresh JODI CSV exports under `data/jodi/` |
 | `pull_eia.py` | Monthly |
 | `pull_faostat.py` | Annually; `--dataset` crops / fertilizer / fbs / all (FBS bulk is large) |
 | `pull_worldbank.py` | Monthly |
@@ -678,7 +695,8 @@ The app should read Supabase settings from `.env` via python-dotenv — use `get
 | Petrochemicals excluded | Plastics and chemicals exposure not mapped | Add HS 2901-2902, 3901-3904 in v2 |
 | Exposure scores not computed | Raw data only, no derived Hormuz dependency index | Build iteratively once data is validated |
 | Pink Sheet XLSX URL can 404 after WB republish | Pull fails until `PINK_SHEET_MONTHLY_XLSX_URL` is updated; check `pipeline_runs.error_message` | Manual URL refresh from World Bank doc page (script logs instructions) |
-| JODI / USGS / GEM on disk not in Postgres | Cannot query those sources in SQL or Streamlit yet | Add DDL + loaders per [HANDOVER.md](HANDOVER.md) **Planned loaders** |
+| USGS / GEM on disk not in Postgres | Cannot query those sources in SQL or Streamlit yet | Add DDL + loaders per [HANDOVER.md](HANDOVER.md) **Planned loaders** |
+| JODI gas CSV is long history | Large row count if you use `--all-years` | Default `load_jodi.py` keeps `data_year >= 2020` (~39% of current gas export); override with `--min-year` / `--all-years` |
 
 ---
 

@@ -174,6 +174,32 @@ CREATE TABLE IF NOT EXISTS cepii_geodep_import_dependence (
     UNIQUE (country, hs6_code, data_year)
 );
 
+-- JODI — country-reported monthly oil/gas statistics (SDMX-style CSV exports).
+-- Complements energy_trade_flows (EIA); definitions differ — do not merge without harmonisation.
+CREATE TABLE IF NOT EXISTS jodi_energy_observations (
+    id                  SERIAL PRIMARY KEY,
+    ref_area            TEXT NOT NULL,
+    country             TEXT,
+    data_year           INTEGER NOT NULL,
+    data_month          INTEGER NOT NULL,
+    energy_product      TEXT NOT NULL,
+    flow_breakdown      TEXT NOT NULL,
+    unit_measure        TEXT NOT NULL,
+    obs_value           NUMERIC,
+    obs_value_raw       TEXT,
+    assessment_code     INTEGER,
+    source_file         TEXT NOT NULL,
+    source              TEXT NOT NULL,
+    pulled_at           TIMESTAMPTZ NOT NULL,
+    UNIQUE (ref_area, data_year, data_month, energy_product, flow_breakdown, unit_measure)
+);
+
+CREATE INDEX IF NOT EXISTS idx_jodi_country_year_month
+    ON jodi_energy_observations (country, data_year, data_month);
+
+CREATE INDEX IF NOT EXISTS idx_jodi_energy_product_year
+    ON jodi_energy_observations (energy_product, data_year);
+
 CREATE INDEX IF NOT EXISTS idx_cepii_geodep_country_year
     ON cepii_geodep_import_dependence (country, data_year);
 
@@ -335,6 +361,16 @@ INSERT INTO table_catalog (
     'country, hs6_code, data_year',
     'loaders/load_cepi_beyond_baci.py geodep',
     120
+),
+(
+    'public',
+    'jodi_energy_observations',
+    'Oil and gas statistics (JODI)',
+    'Monthly country-reported oil and natural gas observations from JODI CSV exports: REF_AREA (ISO2), product (e.g. CRUDEOIL, NATGAS), flow breakdown (balance concept), unit, optional numeric value, assessment code. Maps REF_AREA to ISO3 as country for joins. Complements EIA energy_trade_flows with different coverage and definitions.',
+    'One row per reporter (ISO2), month, energy product, flow breakdown, and unit.',
+    'ref_area, data_year, data_month, energy_product, flow_breakdown, unit_measure',
+    'loaders/load_jodi.py',
+    125
 )
 ON CONFLICT (table_schema, table_name) DO UPDATE SET
     title = EXCLUDED.title,

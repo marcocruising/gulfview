@@ -142,6 +142,16 @@ INSERT INTO table_catalog (
     'country, hs6_code, data_year',
     'loaders/load_cepi_beyond_baci.py geodep',
     120
+),
+(
+    'public',
+    'jodi_energy_observations',
+    'Oil and gas statistics (JODI)',
+    'Monthly country-reported oil and natural gas observations from JODI CSV exports: REF_AREA (ISO2), product (e.g. CRUDEOIL, NATGAS), flow breakdown (balance concept), unit, optional numeric value, assessment code. Maps REF_AREA to ISO3 as country for joins. Complements EIA energy_trade_flows with different coverage and definitions.',
+    'One row per reporter (ISO2), month, energy product, flow breakdown, and unit.',
+    'ref_area, data_year, data_month, energy_product, flow_breakdown, unit_measure',
+    'loaders/load_jodi.py',
+    125
 )
 ON CONFLICT (table_schema, table_name) DO UPDATE SET
     title = EXCLUDED.title,

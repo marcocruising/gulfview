@@ -11,7 +11,7 @@ This note is for the next agent or developer picking up the repo. The canonical 
 - **Rule:** Pullers/loaders write to Supabase; the Streamlit app should read only (see README).
 - **`table_catalog`:** Reference rows describing every application table (purpose, grain, keys, scripts). Seeded from SQL; update [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql) when you add tables.
 
-**Planned loaders (not in repo yet — resume here):** DDL + scripts for **JODI** (`data/jodi/*.csv` → `jodi_energy_observations`), **USGS** (`MCS2026_Commodities_Data.csv` → `usgs_mineral_statistics`; standardised `myb3-*.xlsx` → `usgs_country_mineral_facilities`), **GEM** (`data/globalenergymonitor/*.xlsx` only — skip `*.zip` GIS for v1). Extend `create_tables.sql`, `seed_table_catalog.sql`, and `pipeline_runs`. Details and design notes: Cursor plan *USGS JODI GEM upload* (if available) and [README.md](README.md) **Local data folders**.
+**Planned loaders (not in repo yet — resume here):** DDL + scripts for **USGS** (`MCS2026_Commodities_Data.csv` → `usgs_mineral_statistics`; standardised `myb3-*.xlsx` → `usgs_country_mineral_facilities`), **GEM** (`data/globalenergymonitor/*.xlsx` only — skip `*.zip` GIS for v1). **JODI** is implemented: `data/jodi/*.csv` → `jodi_energy_observations` via [`loaders/load_jodi.py`](loaders/load_jodi.py) (default `data_year >= 2020` for gas history; `--all-years` / `--min-year`). Extend `create_tables.sql`, `seed_table_catalog.sql`, and `pipeline_runs` for USGS/GEM. Details: [README.md](README.md) **Local data folders** and **`load_jodi.py`** subsection.
 
 **Pullers (all log `pipeline_runs`):**
 
@@ -30,6 +30,7 @@ This note is for the next agent or developer picking up the repo. The canonical 
 |--------|--------|
 | [load_baci.py](loaders/load_baci.py) | `bilateral_trade` |
 | [load_cepi_beyond_baci.py](loaders/load_cepi_beyond_baci.py) | `cepii_protee_hs6`, `cepii_geodep_import_dependence` |
+| [load_jodi.py](loaders/load_jodi.py) | `jodi_energy_observations` |
 
 **CEPII beyond BACI (what it is vs `bilateral_trade`):** BACI = reconciled **bilateral flows** (exporter, importer, HS6, value, qty). **ProTEE** = one row per HS6 **import-demand elasticity** + flags (not flows; HS **2007** in CEPII’s file). **GeoDep** = importer × HS6 × year **dependence diagnostics** (HHI, persistence, top supplier code) derived from BACI — not a replacement for flow-level rows. **WTFC/CHELEM zips** in `data/cepi/` are documented in [README.md](README.md) but have **no loader** yet (huge HS96 CSVs). Full semantics: module docstring in `load_cepi_beyond_baci.py` and README **Loaders** subsection.
 
@@ -128,7 +129,7 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 - **`country_macro_indicators`** / **`food_balance_sheets`** — filled by `pull_worldbank_wdi.py` and `pull_faostat.py --dataset fbs` (or `all`) after schema exists.
 - **`hs_code_lookup`** — run [pull_comtrade_hs_lookup.py](pullers/pull_comtrade_hs_lookup.py) once (or after Comtrade updates the JSON).
 - **Streamlit** — tabbed explorer (prices, BACI trade, crops, pipeline); no tabs yet for macro/FBS/energy/fertilizer, **CEPII ProTEE/GeoDep**, **`table_catalog`**, or future JODI/USGS/GEM.
-- **JODI / USGS / GEM** — files live under `data/jodi/`, `data/usgs/`, `data/globalenergymonitor/`; **no loaders or tables yet** (see **Planned loaders** above).
+- **USGS / GEM** — files under `data/usgs/`, `data/globalenergymonitor/`; **no loaders or tables yet** (see **Planned loaders**). **JODI** — `load_jodi.py` + `jodi_energy_observations` (apply DDL if the table is missing).
 - **WTFC / CHELEM zips** under `data/cepi/` — no loader (entire WTFC family deferred, including CHELEM price_range/type zips).
 - **GEM GIS `*.zip`** (geojson/gpkg) — intentionally **deferred**; tabular `.xlsx` first.
 - **Pagination / offset** for EIA/USDA when responses exceed **5000** rows (OK for current year ranges; fragile if ranges widen).
@@ -156,7 +157,7 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 5. **Verify:** `SELECT * FROM pipeline_runs ORDER BY completed_at DESC LIMIT 20;` and row counts per table.
 6. **Streamlit:** `uv run streamlit run app/streamlit_app.py` — prefer **`get_read_client()`** + anon key for anything exposed beyond localhost.
 7. **Optional:** Seed `country_lookup`; production RLS; CI / smoke tests.
-8. **Next data wave:** Implement **JODI** + **USGS** + **GEM** loaders and tables (see **Planned loaders** and README **Local data folders**).
+8. **Next data wave:** **USGS** + **GEM** loaders and tables (see **Planned loaders**). **JODI:** `uv run python loaders/load_jodi.py` (optional `--all-years` / `--min-year`).
 
 ---
 
@@ -176,6 +177,7 @@ uv run python pullers/pull_comtrade_hs_lookup.py
 uv run python loaders/load_baci.py --all
 uv run python loaders/load_cepi_beyond_baci.py protee   # optional
 uv run python loaders/load_cepi_beyond_baci.py geodep   # optional; long
+uv run python loaders/load_jodi.py   # optional; default min year 2020
 
 uv run streamlit run app/streamlit_app.py
 ```

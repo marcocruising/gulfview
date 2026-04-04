@@ -33,7 +33,7 @@ hormuz-supply-chain/
 │
 ├── pullers/                         # scripts that fetch remote data (HTTP API or published file) and write to Supabase
 │   ├── pull_eia.py                  # EIA: crude/LNG/refined product flows
-│   ├── pull_faostat.py              # FAOSTAT: crop production + food trade
+│   ├── pull_faostat.py              # FAOSTAT: crops (bulk ZIP) + fertilizers (API)
 │   ├── pull_worldbank.py            # World Bank Pink Sheet: commodity prices
 │   └── pull_usda_psd.py             # USDA PSD: crop supply/demand by country
 │
@@ -276,18 +276,27 @@ uv run python pullers/pull_eia.py
 
 ### `pull_faostat.py` — FAOSTAT
 
-**Source:** UN Food and Agriculture Organization
+**Source:** UN Food and Agriculture Organization  
 **URL:** https://www.fao.org/faostat/
-**API key:** None required
-**Writes to:** `fertilizer_production`, `crop_production`
-**Data available:** Crop production by country, fertilizer production and trade, food balance sheets
-**Refresh cadence:** Annual (data typically lags 18-24 months)
-**Known limitation:** Fertilizer consumption *by crop* is not directly available — production
-and trade only. Consumption-by-crop breakdowns require IFA reports (manual PDF).
+
+**Crops (`crop_production`):** Bulk normalized ZIP over HTTP (`Production_Crops_Livestock_E_All_Data_(Normalized).zip`). No FAO account required. Optional local file: set **`FAOSTAT_ZIP_PATH`** to skip the download.
+
+**Fertilizers (`fertilizer_production`):** Uses the **`faostat`** Python package and the **FAOSTAT REST API** (`faostat.get_data_df`), not the bulk ZIP. The **Inputs Fertilizers** bulk URL is often **CloudFront/geo or rate blocked** in some networks; the API route avoids that. **FAOSTAT API v2 requires credentials:** set **`FAOSTAT_API_TOKEN`** (JWT) or **`FAOSTAT_USERNAME`** + **`FAOSTAT_PASSWORD`** in `.env` (see [`.env.example`](.env.example)). Dataset code defaults to **`RFN`**; set **`FAOSTAT_FERTILIZER_API_CODE=RFB`** if you need *fertilizers by product* (urea, DAP, MAP, etc.) and `RFN` yields no rows after filters. Optional **`FAOSTAT_API_PAGE_LIMIT`** (default `50000`) controls API pagination batch size.
+
+**CLI — run datasets independently** (avoids re-streaming crops when only fertilizer needs a retry):
 
 ```bash
-uv run python pullers/pull_faostat.py
+uv run python pullers/pull_faostat.py --dataset all         # default: crops then fertilizers
+uv run python pullers/pull_faostat.py --dataset crops       # bulk ZIP only
+uv run python pullers/pull_faostat.py --dataset fertilizer  # API only (needs FAO auth)
 ```
+
+**Writes to:** `crop_production`, `fertilizer_production`  
+**Data available:** Crop area/production/yield for V1 crops; fertilizer production / import / export / agricultural use (as mapped in script) for urea, ammonia, DAP, MAP, NPK-style items  
+**Refresh cadence:** Annual (FAO updates; data often lags 18–24 months)  
+**Known limitation:** Fertilizer consumption *by crop* is not in FAOSTAT — use IFA or other sources for that linkage (manual for V1).
+
+If fertilizer auth is missing or the API fails, the script still upserts crops when you use `--dataset all` or `--dataset crops`, logs **`pipeline_runs.status=partial`**, and records the error message (honest split success).
 
 ### `pull_worldbank.py` — World Bank Pink Sheet
 
@@ -465,6 +474,7 @@ The app should read Supabase settings from `.env` via python-dotenv — use `get
 | Gap | Impact | Planned fix |
 |---|---|---|
 | FAOSTAT crop data lags 18-24 months | Production figures are not current year | Supplement with USDA PSD (more timely) |
+| FAOSTAT fertilizer bulk ZIP blocked in some environments | `fertilizer_production` empty without API path | Use `faostat` API + FAO credentials; run `--dataset fertilizer` |
 | Fertilizer consumption by crop not available | Cannot directly link fertilizer imports to specific crops | Requires IFA reports — manual for now |
 | No vessel-level Hormuz transit data | Cannot count actual tankers transiting | Use EIA factsheet numbers as static reference |
 | BACI is annual only | No monthly trade flow granularity | Add Comtrade API in v2 for recent months |
@@ -486,6 +496,8 @@ requests          # HTTP fetch (APIs and published files)
 python-dotenv     # .env loading
 streamlit         # data explorer UI
 tqdm              # progress bars for loaders
+pycountry         # ISO numeric / alpha country codes (e.g. BACI, FAOSTAT)
+faostat           # FAOSTAT official API client (fertilizer path in pull_faostat)
 ```
 
 Full dependency list lives in `pyproject.toml`. After `uv sync` the exact versions

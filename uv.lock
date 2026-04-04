@@ -345,6 +345,19 @@ wheels = [
 ]
 
 [[package]]
+name = "faostat"
+version = "2.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pandas" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/10/e6/639242daf2a63069f1a8386a6dc8cc17b4672b86a73b86327c9bd4ab9b29/faostat-2.0.1.tar.gz", hash = "sha256:0fac0a15fcbf956cb02764c56775a9efad321bfe31462c2a695cd53fd4541bd8", size = 15957, upload-time = "2026-03-11T19:48:09.522Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ea/ef/07216bbd019d1391ec45ee9bd25288c4dd6c09d3c30749ee79b890e5d6bc/faostat-2.0.1-py3-none-any.whl", hash = "sha256:40a042b0adc7684c91c2619dba9ddb601512e873966940fc67526a21c25ca4b2", size = 11037, upload-time = "2026-03-11T19:48:07.964Z" },
+]
+
+[[package]]
 name = "fsspec"
 version = "2026.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -404,6 +417,7 @@ name = "hormuz-supply-chain"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "faostat" },
     { name = "openpyxl" },
     { name = "pandas" },
     { name = "pycountry" },
@@ -416,6 +430,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "faostat", specifier = ">=2.0.1" },
     { name = "openpyxl", specifier = ">=3.1.0" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "pycountry", specifier = ">=23.12.11" },

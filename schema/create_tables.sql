@@ -200,6 +200,36 @@ CREATE INDEX IF NOT EXISTS idx_jodi_country_year_month
 CREATE INDEX IF NOT EXISTS idx_jodi_energy_product_year
     ON jodi_energy_observations (energy_product, data_year);
 
+-- USGS Mineral Commodity Summaries (MCS) — long-form tables; fingerprint disambiguates duplicate keys in source.
+CREATE TABLE IF NOT EXISTS usgs_mineral_statistics (
+    id                          SERIAL PRIMARY KEY,
+    record_fingerprint          TEXT NOT NULL UNIQUE,
+    mcs_chapter                 TEXT NOT NULL,
+    section                     TEXT NOT NULL,
+    commodity                   TEXT NOT NULL,
+    country_name                TEXT NOT NULL,
+    country_iso3                TEXT,
+    statistics                  TEXT NOT NULL,
+    statistics_detail           TEXT NOT NULL,
+    unit                        TEXT NOT NULL,
+    data_year                   INTEGER NOT NULL,
+    year_as_reported            TEXT NOT NULL,
+    value_numeric               NUMERIC,
+    value_raw                   TEXT,
+    notes                       TEXT,
+    other_notes                 TEXT,
+    is_critical_mineral_2025    BOOLEAN,
+    source_file                 TEXT NOT NULL,
+    source                      TEXT NOT NULL,
+    pulled_at                   TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_usgs_mineral_country_year
+    ON usgs_mineral_statistics (country_iso3, data_year);
+
+CREATE INDEX IF NOT EXISTS idx_usgs_mineral_commodity_year
+    ON usgs_mineral_statistics (commodity, data_year);
+
 CREATE INDEX IF NOT EXISTS idx_cepii_geodep_country_year
     ON cepii_geodep_import_dependence (country, data_year);
 
@@ -371,6 +401,16 @@ INSERT INTO table_catalog (
     'ref_area, data_year, data_month, energy_product, flow_breakdown, unit_measure',
     'loaders/load_jodi.py',
     125
+),
+(
+    'public',
+    'usgs_mineral_statistics',
+    'Mineral commodity summaries (USGS MCS)',
+    'Long-form Mineral Commodity Summaries data: chapter, section, commodity, country, statistic type and detail, unit, year (data_year is start year when CSV gives a range), numeric value when parseable, raw value text, notes, and 2025 critical-mineral flag. country_iso3 mapped from country_name where possible; aggregates (World total, Other countries) have null ISO3. Upsert key is record_fingerprint (hash of row including Value and Notes) because the source repeats some logical keys.',
+    'One row per fingerprinted MCS table line (country × commodity × statistic × unit × reported year label).',
+    'record_fingerprint',
+    'loaders/load_usgs.py mcs',
+    130
 )
 ON CONFLICT (table_schema, table_name) DO UPDATE SET
     title = EXCLUDED.title,

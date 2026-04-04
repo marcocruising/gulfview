@@ -33,8 +33,9 @@ hormuz-supply-chain/
 │
 ├── pullers/                         # scripts that fetch remote data (HTTP API or published file) and write to Supabase
 │   ├── pull_eia.py                  # EIA: crude/LNG/refined product flows
-│   ├── pull_faostat.py              # FAOSTAT: crops (bulk ZIP) + fertilizers (API)
+│   ├── pull_faostat.py              # FAOSTAT: crops (bulk ZIP) + fertilizers (API) + FBS (bulk ZIP)
 │   ├── pull_worldbank.py            # World Bank Pink Sheet: commodity prices
+│   ├── pull_worldbank_wdi.py        # World Bank WDI API: population, GDP, GDP per capita
 │   └── pull_usda_psd.py             # USDA PSD: crop supply/demand by country
 │
 ├── loaders/                         # scripts that ingest manually downloaded files
@@ -205,6 +206,37 @@ pulled_at       TIMESTAMPTZ
 UNIQUE (commodity, data_year, data_month)
 ```
 
+#### `country_macro_indicators`
+Population and national accounts from the World Bank WDI API, for normalising trade and supply data per country.
+
+```sql
+id              SERIAL PRIMARY KEY
+country         TEXT              -- ISO3
+indicator       TEXT              -- 'population' | 'gdp_current_usd' | 'gdp_per_capita_current_usd'
+value           NUMERIC
+unit            TEXT              -- 'persons' | 'current_usd'
+data_year       INTEGER
+source          TEXT
+pulled_at       TIMESTAMPTZ
+UNIQUE (country, indicator, data_year)
+```
+
+#### `food_balance_sheets`
+FAOSTAT Food Balance Sheets (FBS): domestic supply, trade, and use of major food commodities in **tonnes** (imports in context of production, food, feed, etc.).
+
+```sql
+id              SERIAL PRIMARY KEY
+country         TEXT              -- ISO3
+commodity       TEXT              -- 'wheat' | 'rice' | 'corn' | 'soybeans' | 'cotton' (cotton = FBS Cottonseed item)
+metric          TEXT              -- e.g. 'production', 'imports', 'exports', 'domestic_supply', 'food', 'feed'
+value           NUMERIC           -- metric tonnes
+unit            TEXT              -- 'tonnes'
+data_year       INTEGER
+source          TEXT
+pulled_at       TIMESTAMPTZ
+UNIQUE (country, commodity, metric, data_year)
+```
+
 #### `hs_code_lookup`
 Reference table for HS codes used in this project.
 
@@ -291,18 +323,21 @@ Dataset code defaults to **`RFB`** (*fertilizers by product* — urea, DAP, MAP,
 
 **Never put real tokens in `.env.example`** — placeholders only; rotate any token that was ever committed there.
 
-**CLI — run datasets independently** (avoids re-streaming crops when only fertilizer needs a retry):
+**CLI — run datasets independently** (avoids re-streaming large ZIPs when only one leg needs a retry):
 
 ```bash
-uv run python pullers/pull_faostat.py --dataset all         # default: crops then fertilizers
-uv run python pullers/pull_faostat.py --dataset crops       # bulk ZIP only
+uv run python pullers/pull_faostat.py --dataset all         # default: crops, fertilizers, FBS
+uv run python pullers/pull_faostat.py --dataset crops       # crop bulk ZIP only
 uv run python pullers/pull_faostat.py --dataset fertilizer  # API only (needs FAO auth)
+uv run python pullers/pull_faostat.py --dataset fbs         # Food Balance Sheets bulk ZIP only (no FAO API)
 ```
 
-**Writes to:** `crop_production`, `fertilizer_production`  
-**Data available:** Crop area/production/yield for V1 crops; fertilizer production / import / export / agricultural use (as mapped in script) for urea, ammonia, DAP, MAP, NPK-style items  
+**Food Balance Sheets (`food_balance_sheets`):** Normalized bulk ZIP over HTTP — `FoodBalanceSheets_E_All_Data_(Normalized).zip` under FAOSTAT production bulks (same host as crop bulk). Optional local file: **`FAOSTAT_FBS_ZIP_PATH`** skips the download. The puller keeps V1 commodities only (wheat, rice, corn, soybeans, cotton); **cotton** maps to the FBS *Cottonseed* item. Mass elements only (`1000 t` → stored as **tonnes**): production, imports, exports, domestic supply, food, feed, losses, processing, stock variation, etc. (see `FBS_ELEMENT_MAP` in the script).
+
+**Writes to:** `crop_production`, `fertilizer_production`, `food_balance_sheets`  
+**Data available:** Crop area/production/yield for V1 crops; fertilizer production / import / export / agricultural use (as mapped in script) for urea, ammonia, DAP, MAP, NPK-style items; FBS supply and use for the V1 food commodities above  
 **Refresh cadence:** Annual (FAO updates; data often lags 18–24 months)  
-**Known limitation:** Fertilizer consumption *by crop* is not in FAOSTAT — use IFA or other sources for that linkage (manual for V1).
+**Known limitation:** Fertilizer consumption *by crop* is not in FAOSTAT — use IFA or other sources for that linkage (manual for V1). FBS file is large (~600MB+ CSV inside ZIP); full runs take several minutes.
 
 If fertilizer auth is missing or the API fails, the script still upserts crops when you use `--dataset all` or `--dataset crops`, logs **`pipeline_runs.status=partial`**, and records the error message (honest split success).
 
@@ -341,6 +376,23 @@ If fertilizer auth is missing or the API fails, the script still upserts crops w
 
 ```bash
 uv run python pullers/pull_worldbank.py
+```
+
+### `pull_worldbank_wdi.py` — World Development Indicators (macro context)
+
+**Source:** World Bank Open Data  
+**URL:** https://data.worldbank.org/ — API `https://api.worldbank.org/v2/`  
+**API key:** None required  
+
+**Indicators (by default):** `SP.POP.TOTL` (population), `NY.GDP.MKTP.CD` (GDP, current US$), `NY.GDP.PCAP.CD` (GDP per capita, current US$). The v2 API accepts **one indicator per request**; the script issues three paginated downloads per run.
+
+**Writes to:** `country_macro_indicators`  
+**Data available:** Annual series by country (ISO 3166-1 members only; World Bank regions and aggregates are excluded via `pycountry`).  
+**Refresh cadence:** Annual (re-run when you extend `YEARS` or after WDI updates).  
+**Known limitation:** Indicator set is fixed in script config; extend `WDI_INDICATORS` to add more series.
+
+```bash
+uv run python pullers/pull_worldbank_wdi.py
 ```
 
 ### `pull_usda_psd.py` — USDA Production, Supply and Distribution
@@ -418,6 +470,7 @@ uv run python loaders/load_baci.py --all
 uv run python pullers/pull_eia.py
 uv run python pullers/pull_faostat.py --dataset all
 uv run python pullers/pull_worldbank.py
+uv run python pullers/pull_worldbank_wdi.py
 uv run python pullers/pull_usda_psd.py
 
 # 5. Launch the explorer
@@ -432,8 +485,9 @@ uv run streamlit run app/streamlit_app.py
 |---|---|
 | `load_baci.py` | Annually, when CEPII releases new year |
 | `pull_eia.py` | Monthly |
-| `pull_faostat.py` | Annually (or when FAO releases updates); `--dataset` to refresh crops, fertilizer, or both |
+| `pull_faostat.py` | Annually; `--dataset` crops / fertilizer / fbs / all (FBS bulk is large) |
 | `pull_worldbank.py` | Monthly |
+| `pull_worldbank_wdi.py` | Annual (or when extending years) |
 | `pull_usda_psd.py` | Monthly |
 
 Check what is in your database and when it was last pulled:
@@ -548,6 +602,7 @@ COUNTRIES = None                    # None = all available countries
 - Add UN Comtrade API for recent bilateral data (fills BACI annual lag)
 - Add petrochemicals (HS 2901-2902, 3901-3904)
 - Add IFA fertilizer consumption data (manual PDF extraction)
+- **UNCTAD:** Merchandise Trade Matrix and product / import concentration indices (free UNCTAD data) for country-risk and exposure scoring — deferred as likely overkill until the V3 analysis layer
 
 **V3 — Analysis layer**
 - Compute Hormuz exposure scores per country

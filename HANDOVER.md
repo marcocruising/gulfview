@@ -26,13 +26,20 @@ Additional keys:
 
 - `EIA_API_KEY` — [pullers/pull_eia.py](pullers/pull_eia.py)
 - `USDA_FAS_API_KEY` — [pullers/pull_usda_psd.py](pullers/pull_usda_psd.py)
-- **FAOSTAT fertilizer API** — [pullers/pull_faostat.py](pullers/pull_faostat.py): `FAOSTAT_API_TOKEN` *or* `FAOSTAT_USERNAME` + `FAOSTAT_PASSWORD` (required for `--dataset fertilizer` / `--dataset all` fertilizer leg). Optional: `FAOSTAT_FERTILIZER_API_CODE` (default **`RFB`**; **`RFN`** = by nutrient), `FAOSTAT_API_PAGE_LIMIT`, `FAOSTAT_API_AREA_CHUNK`, `FAOSTAT_API_SLEEP_SEC`, `FAOSTAT_API_AREAS` (comma-separated FAO area codes), `FAOSTAT_ZIP_PATH` (crop bulk only).
+- **FAOSTAT fertilizer API** — [pullers/pull_faostat.py](pullers/pull_faostat.py): `FAOSTAT_API_TOKEN` *or* `FAOSTAT_USERNAME` + `FAOSTAT_PASSWORD` (required for `--dataset fertilizer` / `--dataset all` fertilizer leg). Optional: `FAOSTAT_FERTILIZER_API_CODE` (default **`RFB`**; **`RFN`** = by nutrient), `FAOSTAT_API_PAGE_LIMIT`, `FAOSTAT_API_AREA_CHUNK`, `FAOSTAT_API_SLEEP_SEC`, `FAOSTAT_API_AREAS` (comma-separated FAO area codes), `FAOSTAT_ZIP_PATH` (crop bulk only), `FAOSTAT_FBS_ZIP_PATH` (Food Balance bulk only).
 
 Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (placeholders only); rotate any secret that was ever committed there. Do not print API keys in tracebacks or `HTTPError` URLs; redact in logs where possible.
 
 ---
 
 ## Learnings (implementation reality)
+
+### World Bank WDI — [pullers/pull_worldbank_wdi.py](pullers/pull_worldbank_wdi.py)
+
+- **Separate script** from Pink Sheet: JSON API `https://api.worldbank.org/v2/country/all/indicator/{ID}` with **one indicator per request** (multi-indicator paths return invalid-parameter errors).
+- **Pagination:** follow `pages` in the first JSON object until done; `per_page=20000` is enough for `country/all` × multi-year pulls in practice.
+- **Country filter:** keep only rows where `countryiso3code` is a **real ISO3** (`pycountry.countries.get(alpha_3=...)`), so WB regions (AFE, WLD, …) drop out.
+- **Writes:** `country_macro_indicators` with upsert on `(country, indicator, data_year)`.
 
 ### World Bank Pink Sheet — [pullers/pull_worldbank.py](pullers/pull_worldbank.py)
 
@@ -64,7 +71,8 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 - **`pars={'area': 'all'}` is invalid** — the API returns an **empty** frame. The puller loads **FAO country area codes** from `get_par_df(dataset, 'area')` (rows with `aggregate_type == '0'`), then queries in **chunks** of **`FAOSTAT_API_AREA_CHUNK`** (default 40) with **`year`** = configured **`YEARS`**, optional **`FAOSTAT_API_SLEEP_SEC`** between chunks, optional **`FAOSTAT_API_AREAS`** to restrict codes.
 - Default API dataset code **`RFB`** (*by product*). **`RFN`** = *by nutrient*; switch with **`FAOSTAT_FERTILIZER_API_CODE`** if you extend item mapping.
 - Rows use the **`Area`** (country name) column mapped to **ISO3** via `pycountry` (plus a small skip list for composite labels). M49 column is used when present.
-- **`--dataset crops` | `fertilizer` | `all`:** run each leg independently so retries do not re-stream crops. With `--dataset all`, if fertilizer fails, **`pipeline_runs`** is **`partial`**, crops still written, error message explains fertilizer (intentional).
+- **FBS (`food_balance_sheets`):** bulk ZIP `FoodBalanceSheets_E_All_Data_(Normalized).zip` (production bulks host). **`FAOSTAT_FBS_ZIP_PATH`** skips HTTP. Stream CSV in chunks; filter **`Item Code`** / **`Element Code`** / **`YEARS`**; **`Area Code (M49)`** → ISO3 via `_m49_to_iso3`. Units **`1000 t`** → multiply to **tonnes** (`_fbs_value_to_tonnes`). V1 item map: wheat/rice/corn/soybeans + **cotton** from **Cottonseed** (see `FBS_ITEM_TO_COMMODITY` in script). Full ZIP is **large** (~10+ minutes possible).
+- **`--dataset crops` | `fertilizer` | `fbs` | `all`:** run each leg independently so retries do not re-stream huge ZIPs. With `--dataset all`, fertilizer or FBS failure → **`pipeline_runs`** **`partial`**, other legs still written.
 - **`faostat.set_requests_args`** mutates global client state — call **once** per process (the package appends `lang/` to its base URL if invoked repeatedly).
 
 ### BACI — [loaders/load_baci.py](loaders/load_baci.py)
@@ -118,7 +126,8 @@ uv sync
 cp .env.example .env   # then fill secrets
 
 uv run python pullers/pull_worldbank.py
-uv run python pullers/pull_faostat.py --dataset all   # or: --dataset crops | --dataset fertilizer
+uv run python pullers/pull_worldbank_wdi.py
+uv run python pullers/pull_faostat.py --dataset all   # or: crops | fertilizer | fbs
 uv run python pullers/pull_eia.py
 uv run python pullers/pull_usda_psd.py
 uv run python loaders/load_baci.py --all

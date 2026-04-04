@@ -77,6 +77,31 @@ CREATE TABLE IF NOT EXISTS commodity_prices (
     UNIQUE (commodity, data_year, data_month)
 );
 
+CREATE TABLE IF NOT EXISTS country_macro_indicators (
+    id              SERIAL PRIMARY KEY,
+    country         TEXT NOT NULL,
+    indicator       TEXT NOT NULL,
+    value           NUMERIC,
+    unit            TEXT NOT NULL,
+    data_year       INTEGER NOT NULL,
+    source          TEXT NOT NULL,
+    pulled_at       TIMESTAMPTZ NOT NULL,
+    UNIQUE (country, indicator, data_year)
+);
+
+CREATE TABLE IF NOT EXISTS food_balance_sheets (
+    id              SERIAL PRIMARY KEY,
+    country         TEXT NOT NULL,
+    commodity       TEXT NOT NULL,
+    metric          TEXT NOT NULL,
+    value           NUMERIC,
+    unit            TEXT NOT NULL,
+    data_year       INTEGER NOT NULL,
+    source          TEXT NOT NULL,
+    pulled_at       TIMESTAMPTZ NOT NULL,
+    UNIQUE (country, commodity, metric, data_year)
+);
+
 CREATE TABLE IF NOT EXISTS hs_code_lookup (
     hs6_code        TEXT PRIMARY KEY,
     description     TEXT,
@@ -94,3 +119,15 @@ CREATE TABLE IF NOT EXISTS country_lookup (
 
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_completed_at
     ON pipeline_runs (completed_at DESC NULLS LAST);
+
+CREATE INDEX IF NOT EXISTS idx_country_macro_indicators_country_year
+    ON country_macro_indicators (country, data_year);
+
+CREATE INDEX IF NOT EXISTS idx_country_macro_indicators_data_year
+    ON country_macro_indicators (data_year);
+
+CREATE INDEX IF NOT EXISTS idx_food_balance_sheets_country_year
+    ON food_balance_sheets (country, data_year);
+
+CREATE INDEX IF NOT EXISTS idx_food_balance_sheets_data_year
+    ON food_balance_sheets (data_year);

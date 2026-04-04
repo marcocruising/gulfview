@@ -3,10 +3,11 @@
 # SOURCE:  UN FAO FAOSTAT
 # URL:     https://www.fao.org/faostat/
 # API KEY: Crops: none (bulk ZIP). Fertilizer: FAOSTAT API token or user/pass (faostat pkg v2).
-# WRITES:  crop_production, fertilizer_production
+# WRITES:  crop_production, fertilizer_production, food_balance_sheets
 # REFRESH: annual
-# NOTES:   FAOSTAT_ZIP_PATH skips crop bulk download. Fertilizer uses faostat.get_data_df (not bulk URL).
-#          Run: --dataset crops | fertilizer | all
+# NOTES:   FAOSTAT_ZIP_PATH skips crop bulk download. FAOSTAT_FBS_ZIP_PATH skips FBS bulk download.
+#          Fertilizer uses faostat.get_data_df (not bulk URL).
+#          Run: --dataset crops | fertilizer | fbs | all
 # ============================================================
 
 # --- CONFIGURATION — edit these values before running --------
@@ -17,11 +18,40 @@ FAOSTAT_PRODUCTION_ZIP = (
     "https://bulks-faostat.fao.org/production/"
     "Production_Crops_Livestock_E_All_Data_(Normalized).zip"
 )
+FAOSTAT_FBS_ZIP = (
+    "https://bulks-faostat.fao.org/production/"
+    "FoodBalanceSheets_E_All_Data_(Normalized).zip"
+)
 # FAOSTAT API dataset code (env FAOSTAT_FERTILIZER_API_CODE). RFB = by product; RFN = by nutrient (N/P/K).
 FAOSTAT_FERTILIZER_API_CODE_DEFAULT = "RFB"
 FAOSTAT_API_PAGE_LIMIT_DEFAULT = 50_000
 FAOSTAT_API_AREA_CHUNK_DEFAULT = 40
 CHUNK_ROWS = 80000
+FBS_CHUNK_ROWS = 120_000
+# FBS Item Code -> commodity slug (V1 crops; cotton uses Cottonseed as FBS mass-balance proxy).
+FBS_ITEM_TO_COMMODITY: dict[int, str] = {
+    2511: "wheat",
+    2807: "rice",
+    2514: "corn",
+    2555: "soybeans",
+    2559: "cotton",
+}
+# FBS Element Code -> stable metric slug (tonnes-based supply elements only).
+FBS_ELEMENT_MAP: dict[int, str] = {
+    5511: "production",
+    5611: "imports",
+    5911: "exports",
+    5301: "domestic_supply",
+    5521: "feed",
+    5142: "food",
+    5123: "losses",
+    5154: "other_uses_non_food",
+    5131: "processing",
+    5072: "stock_variation",
+    5170: "residuals",
+    5527: "seed",
+    5171: "tourist_consumption",
+}
 # -------------------------------------------------------------
 
 import argparse
@@ -45,11 +75,13 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from supabase import Client
+
 from utils.pipeline_logger import finish_run, start_run
 from utils.supabase_client import get_client
 
 SCRIPT_NAME = "pull_faostat"
-SOURCE_LABEL = "FAOSTAT crops (bulk ZIP) + fertilizers (faostat API)"
+SOURCE_LABEL = "FAOSTAT crops (bulk) + fertilizers (API) + FBS (bulk ZIP)"
 UPSERT_BATCH = 800
 ITEM_TO_CROP = {15: "wheat", 27: "rice", 56: "maize", 236: "soybeans", 328: "cotton"}
 ELEMENT_MAP = {
@@ -421,13 +453,141 @@ def _process_crops_zip(zf: zipfile.ZipFile, pulled_at: str) -> list[dict[str, An
     return crop_rows
 
 
+def _fbs_value_to_tonnes(value: float, unit_raw: object) -> float | None:
+    """FBS bulk uses '1000 t' for mass elements; convert to metric tonnes."""
+    if unit_raw is None or (isinstance(unit_raw, float) and pd.isna(unit_raw)):
+        return None
+    u = str(unit_raw).lower().replace("\xa0", " ").strip()
+    if "1000" in u and "t" in u:
+        return float(value) * 1000.0
+    if u in ("1000 t", "1000t"):
+        return float(value) * 1000.0
+    return None
+
+
+def _aggregate_fbs_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sums: dict[tuple[str, str, str, int], float] = defaultdict(float)
+    meta: dict[tuple[str, str, str, int], tuple[str, str]] = {}
+    for r in rows:
+        key = (r["country"], r["commodity"], r["metric"], r["data_year"])
+        v = r.get("value")
+        if v is None:
+            continue
+        sums[key] += float(v)
+        meta[key] = (r["source"], r["pulled_at"])
+    out: list[dict[str, Any]] = []
+    for key, total in sums.items():
+        src, pulled = meta[key]
+        out.append(
+            {
+                "country": key[0],
+                "commodity": key[1],
+                "metric": key[2],
+                "value": total,
+                "unit": "tonnes",
+                "data_year": key[3],
+                "source": src,
+                "pulled_at": pulled,
+            }
+        )
+    return out
+
+
+def _process_fbs_zip(zf: zipfile.ZipFile, pulled_at: str) -> list[dict[str, Any]]:
+    csv_name = next(
+        n
+        for n in zf.namelist()
+        if n.endswith(".csv") and "Normalized" in n and "FoodBalance" in n
+    )
+    item_set = set(FBS_ITEM_TO_COMMODITY.keys())
+    elem_set = set(FBS_ELEMENT_MAP.keys())
+    raw_rows: list[dict[str, Any]] = []
+    with zf.open(csv_name) as zcsv:
+        for chunk in tqdm(
+            pd.read_csv(zcsv, chunksize=FBS_CHUNK_ROWS, encoding="utf-8", low_memory=False),
+            desc="FAOSTAT FBS",
+        ):
+            need = {"Item Code", "Element Code", "Year", "Value", "Unit", "Area Code (M49)"}
+            if not need.issubset(set(chunk.columns)):
+                raise RuntimeError(
+                    "Unexpected FBS CSV columns; missing "
+                    f"{need - set(chunk.columns)}. Got: {list(chunk.columns)}"
+                )
+            work = chunk.copy()
+            work["Year"] = pd.to_numeric(work["Year"], errors="coerce")
+            work["Element Code"] = pd.to_numeric(work["Element Code"], errors="coerce")
+            work["Item Code"] = pd.to_numeric(work["Item Code"], errors="coerce")
+            sub = work[
+                work["Item Code"].isin(item_set)
+                & work["Element Code"].isin(elem_set)
+                & work["Year"].isin(YEARS)
+            ]
+            if sub.empty:
+                continue
+            for _, r in sub.iterrows():
+                iso3 = _m49_to_iso3(r.get("Area Code (M49)"))
+                if not iso3:
+                    continue
+                ic = int(r["Item Code"])
+                ec = int(r["Element Code"])
+                commodity = FBS_ITEM_TO_COMMODITY.get(ic)
+                metric = FBS_ELEMENT_MAP.get(ec)
+                if not commodity or not metric:
+                    continue
+                val = r.get("Value")
+                if pd.isna(val):
+                    continue
+                try:
+                    v = float(val)
+                except (TypeError, ValueError):
+                    continue
+                tonnes = _fbs_value_to_tonnes(v, r.get("Unit"))
+                if tonnes is None:
+                    continue
+                raw_rows.append(
+                    {
+                        "country": iso3,
+                        "commodity": commodity,
+                        "metric": metric,
+                        "value": tonnes,
+                        "unit": "tonnes",
+                        "data_year": int(r["Year"]),
+                        "source": SCRIPT_NAME,
+                        "pulled_at": pulled_at,
+                    }
+                )
+    return _aggregate_fbs_rows(raw_rows)
+
+
+def _finish_multi_leg(
+    client: Client,
+    run_id: int,
+    n_c: int,
+    n_f: int,
+    n_b: int,
+    fert_error: str | None,
+    fbs_error: str | None,
+) -> None:
+    """Complete pipeline_runs for --dataset all."""
+    total = n_c + n_f + n_b
+    parts: list[str] = []
+    if fert_error:
+        parts.append(fert_error)
+    if fbs_error:
+        parts.append(fbs_error)
+    if parts:
+        finish_run(client, run_id, total, "partial", " | ".join(parts))
+    else:
+        finish_run(client, run_id, total, "success", None)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Load FAOSTAT crops and/or fertilizers into Supabase.")
+    ap = argparse.ArgumentParser(description="Load FAOSTAT crops, fertilizers, and/or FBS into Supabase.")
     ap.add_argument(
         "--dataset",
-        choices=("crops", "fertilizer", "all"),
+        choices=("crops", "fertilizer", "fbs", "all"),
         default="all",
-        help="crops=bulk ZIP only; fertilizer=faostat API only; all=both (default).",
+        help="crops=bulk ZIP; fertilizer=API; fbs=Food Balance bulk ZIP; all=all three (default).",
     )
     args = ap.parse_args()
 
@@ -435,12 +595,18 @@ def main() -> int:
     pulled_at = datetime.now(timezone.utc).isoformat()
     crop_rows: list[dict[str, Any]] = []
     fert_rows: list[dict[str, Any]] = []
+    fbs_rows: list[dict[str, Any]] = []
     fert_error: str | None = None
+    fbs_error: str | None = None
 
     code = (
         os.environ.get("FAOSTAT_FERTILIZER_API_CODE") or FAOSTAT_FERTILIZER_API_CODE_DEFAULT
     ).strip()
-    chunk_sz = int(os.environ["FAOSTAT_API_AREA_CHUNK"]) if os.environ.get("FAOSTAT_API_AREA_CHUNK") else FAOSTAT_API_AREA_CHUNK_DEFAULT
+    chunk_sz = (
+        int(os.environ["FAOSTAT_API_AREA_CHUNK"])
+        if os.environ.get("FAOSTAT_API_AREA_CHUNK")
+        else FAOSTAT_API_AREA_CHUNK_DEFAULT
+    )
     run_id = start_run(
         client,
         SCRIPT_NAME,
@@ -448,7 +614,8 @@ def main() -> int:
         {
             "years": YEARS,
             "dataset": args.dataset,
-            "crop_zip": FAOSTAT_PRODUCTION_ZIP,
+            "crop_zip": FAOSTAT_PRODUCTION_ZIP if args.dataset in ("crops", "all") else None,
+            "fbs_zip": FAOSTAT_FBS_ZIP if args.dataset in ("fbs", "all") else None,
             "fertilizer_api_code": code if args.dataset in ("fertilizer", "all") else None,
             "fertilizer_area_chunk": chunk_sz if args.dataset in ("fertilizer", "all") else None,
         },
@@ -482,6 +649,18 @@ def main() -> int:
                     "If using RFN, try FAOSTAT_FERTILIZER_API_CODE=RFB; widen YEARS or check FAOSTAT layout."
                 )
 
+    if args.dataset in ("fbs", "all"):
+        try:
+            raw_fbs = _load_zip_bytes(FAOSTAT_FBS_ZIP, "FAOSTAT_FBS_ZIP_PATH")
+            zb = zipfile.ZipFile(io.BytesIO(raw_fbs))
+            fbs_rows = _process_fbs_zip(zb, pulled_at)
+        except Exception as e:
+            fbs_error = f"FBS bulk failed: {type(e).__name__}: {e}"
+            fbs_rows = []
+        else:
+            if not fbs_rows:
+                fbs_error = "No FBS rows after filters (item/element/year/units or M49 mapping)."
+
     if crop_rows:
         for i in range(0, len(crop_rows), UPSERT_BATCH):
             client.table("crop_production").upsert(
@@ -496,8 +675,15 @@ def main() -> int:
                 on_conflict="country,fertilizer_type,metric,data_year",
             ).execute()
 
-    n_c, n_f = len(crop_rows), len(fert_rows)
-    total_written = n_c + n_f
+    if fbs_rows:
+        for i in range(0, len(fbs_rows), UPSERT_BATCH):
+            client.table("food_balance_sheets").upsert(
+                fbs_rows[i : i + UPSERT_BATCH],
+                on_conflict="country,commodity,metric,data_year",
+            ).execute()
+
+    n_c, n_f, n_b = len(crop_rows), len(fert_rows), len(fbs_rows)
+    total_written = n_c + n_f + n_b
 
     if args.dataset == "crops":
         finish_run(client, run_id, n_c, "success", None)
@@ -517,19 +703,52 @@ def main() -> int:
         print(f"Upserted {n_f} fertilizer rows.")
         return 0
 
-    if fert_error and not fert_rows:
-        msg = f"{fert_error} | Upserted {n_c} crop rows; fertilizer_production unchanged."
+    if args.dataset == "fbs":
+        if fbs_error and not fbs_rows:
+            finish_run(client, run_id, 0, "partial", fbs_error)
+            print(fbs_error, file=sys.stderr)
+            return 0
+        if fbs_error:
+            finish_run(client, run_id, n_b, "partial", fbs_error)
+            print(f"Upserted {n_b} FBS rows. {fbs_error}")
+            return 0
+        finish_run(client, run_id, n_b, "success", None)
+        print(f"Upserted {n_b} FBS rows.")
+        return 0
+
+    # --dataset all
+    if fert_error and not fert_rows and fbs_error and not fbs_rows:
+        msg = (
+            f"{fert_error} | {fbs_error} | Upserted {n_c} crop rows; "
+            "fertilizer_production and food_balance_sheets unchanged."
+        )
         finish_run(client, run_id, n_c, "partial", msg)
         print(f"Upserted {n_c} crop rows. {msg}")
         return 0
-    if fert_error:
-        msg = f"{fert_error} | Crops {n_c}, fertilizer {n_f} rows."
-        finish_run(client, run_id, total_written, "partial", msg)
-        print(f"Upserted {n_c} crop and {n_f} fertilizer rows. {msg}")
+    if fert_error and not fert_rows:
+        _finish_multi_leg(client, run_id, n_c, n_f, n_b, fert_error, fbs_error)
+        msg = f"{fert_error} | Upserted {n_c} crop rows; fertilizer unchanged."
+        if fbs_error:
+            msg += f" {fbs_error}"
+        print(f"Upserted {n_c} crop, {n_f} fertilizer, {n_b} FBS rows. {msg}")
+        return 0
+    if fbs_error and not fbs_rows:
+        _finish_multi_leg(client, run_id, n_c, n_f, n_b, fert_error, fbs_error)
+        msg = f"{fbs_error} | Upserted {n_c} crop, {n_f} fertilizer rows; FBS unchanged."
+        if fert_error:
+            msg = f"{fert_error} | {msg}"
+        print(msg)
+        return 0
+    if fert_error or fbs_error:
+        _finish_multi_leg(client, run_id, n_c, n_f, n_b, fert_error, fbs_error)
+        print(
+            f"Upserted {n_c} crop, {n_f} fertilizer, {n_b} FBS rows. "
+            f"{fert_error or ''} {fbs_error or ''}".strip()
+        )
         return 0
 
     finish_run(client, run_id, total_written, "success", None)
-    print(f"Upserted {n_c} crop rows and {n_f} fertilizer rows.")
+    print(f"Upserted {n_c} crop, {n_f} fertilizer, and {n_b} FBS rows.")
     return 0
 
 

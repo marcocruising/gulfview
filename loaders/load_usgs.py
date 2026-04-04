@@ -7,6 +7,10 @@
 # REFRESH: annual when USGS publishes new MCS tables / yearbooks
 # NOTES:   MCS CSV under data/usgs/ (cp1252). myb3-*.xlsx: Table 1 melt + Table 2 merged blocks.
 #
+#   myb3 Table 1 (parse_myb3_table1): sheet ``^table\\s*1$``; first row with col A starting with
+#   ``Commodity`` = header; year columns melted; section rows (METALS / INDUSTRIAL MINERALS) + colon
+#   hierarchy in commodity_path; footnotes r/e in spacer columns.
+#
 #   myb3 Table 2 (parse_myb3_table2) — USGS conventions for future country files:
 #   - Do./do. in commodity column → commodity_leaf_resolved = last explicit label; commodity_cell_raw stores that
 #     same resolved label (not NULL) so every row is fully labeled in the UI.
@@ -22,6 +26,19 @@
 #   - Before upsert, existing rows with the same source_file are deleted (avoids orphan rows when
 #     record_fingerprint changes).
 #   - QA: uv run python scripts/validate_myb3_table2.py
+#
+#   Adding another country (checklist):
+#   1) Save as data/usgs/myb3-{YEAR}-{slug}.xlsx (slug = lowercase hyphenated, e.g. kuwait).
+#   2) Add slug → ISO3 in MYB3_SLUG_TO_ISO3 (unmapped files are skipped; pipeline_runs may be partial).
+#   3) Keep standard three-sheet layout: Text (ignored), Table 1 / Table 1, Table 2 / Table 2.
+#   4) Run: uv run python scripts/validate_myb3_table2.py && uv run python loaders/load_usgs.py facilities
+#
+#   Residual risks (rare in current files; extend code if you hit them):
+#   - Col A is only a hierarchy label with no owner/loc/cap on that line, then Do. on the next row:
+#     last commodity may not update until we add explicit handling.
+#   - Table 2 header text changes so much that _t2_detect_columns cannot find owner/loc/cap columns.
+#   - A top-level product word not in _T2_ROOT_FIRST_WORDS may leave a deeper facility_stack in place;
+#     add the word to the frozenset if grouping looks wrong.
 # ============================================================
 
 from __future__ import annotations

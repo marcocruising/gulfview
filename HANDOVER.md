@@ -11,7 +11,7 @@ This note is for the next agent or developer picking up the repo. The canonical 
 - **Rule:** Pullers/loaders write to Supabase; the Streamlit app should read only (see README).
 - **`table_catalog`:** Reference rows describing every application table (purpose, grain, keys, scripts). Seeded from SQL; update [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql) when you add tables.
 
-**Planned loaders (not in repo yet — resume here):** **USGS myb3** — full spec below in **USGS myb3 yearbooks** (files exist under `data/usgs/`; DDL + `load_usgs.py facilities` still to build). **GEM** (`data/globalenergymonitor/*.xlsx` only — skip `*.zip` GIS for v1). **Done:** **JODI** [`load_jodi.py`](loaders/load_jodi.py); **USGS MCS** [`load_usgs.py`](loaders/load_usgs.py) `mcs` → `usgs_mineral_statistics` (fingerprint upsert; `cp1252` CSV; `year_as_reported` for ranges like `2021–24`). Extend schema/catalog when GEM or myb3 land.
+**Planned loaders (not in repo yet — resume here):** **GEM** (`data/globalenergymonitor/*.xlsx` only — skip `*.zip` GIS for v1). **Done:** **JODI** [`load_jodi.py`](loaders/load_jodi.py); **USGS** [`load_usgs.py`](loaders/load_usgs.py) — `mcs` → `usgs_mineral_statistics`; **`facilities`** → `usgs_myb3_production` + `usgs_country_mineral_facilities` from `myb3-*.xlsx`. Extend schema/catalog when GEM lands.
 
 **Pullers (all log `pipeline_runs`):**
 
@@ -31,55 +31,27 @@ This note is for the next agent or developer picking up the repo. The canonical 
 | [load_baci.py](loaders/load_baci.py) | `bilateral_trade` |
 | [load_cepi_beyond_baci.py](loaders/load_cepi_beyond_baci.py) | `cepii_protee_hs6`, `cepii_geodep_import_dependence` |
 | [load_jodi.py](loaders/load_jodi.py) | `jodi_energy_observations` |
-| [load_usgs.py](loaders/load_usgs.py) | `usgs_mineral_statistics` (`mcs`); myb3 → `usgs_myb3_production` + `usgs_country_mineral_facilities` (**not implemented** — see **USGS myb3 yearbooks**) |
+| [load_usgs.py](loaders/load_usgs.py) | `usgs_mineral_statistics` (`mcs`); `usgs_myb3_production` + `usgs_country_mineral_facilities` (`facilities` / `myb3*.xlsx`) |
 
 **CEPII beyond BACI (what it is vs `bilateral_trade`):** BACI = reconciled **bilateral flows** (exporter, importer, HS6, value, qty). **ProTEE** = one row per HS6 **import-demand elasticity** + flags (not flows; HS **2007** in CEPII’s file). **GeoDep** = importer × HS6 × year **dependence diagnostics** (HHI, persistence, top supplier code) derived from BACI — not a replacement for flow-level rows. **WTFC/CHELEM zips** in `data/cepi/` are documented in [README.md](README.md) but have **no loader** yet (huge HS96 CSVs). Full semantics: module docstring in `load_cepi_beyond_baci.py` and README **Loaders** subsection.
 
 ---
 
-## USGS myb3 yearbooks — resume implementation here
+## USGS myb3 yearbooks (`myb3-*.xlsx`)
 
-**Status:** Regional **`myb3-*.xlsx`** files are expected under [`data/usgs/`](data/usgs/). **[`loaders/load_usgs.py`](loaders/load_usgs.py) `facilities`** is still a **stub** (`pipeline_runs` *partial*). There is **no** `usgs_myb3_production` or `usgs_country_mineral_facilities` table in [`schema/create_tables.sql`](schema/create_tables.sql) yet — add DDL, `seed_table_catalog.sql`, Supabase migration, then implement parsing.
+**Status:** Implemented. Run **`uv run python loaders/load_usgs.py facilities`** with regional workbooks under [`data/usgs/`](data/usgs/). **`pipeline_runs.source_label`** for that leg is *USGS Minerals Yearbook myb3 country xlsx*.
 
-**IDE note:** Cursor may label `.xlsx` unsupported and workspace search may omit them; use **`Path.glob("myb3*.xlsx")`** on `data/usgs` or list the directory in a shell — files are still on disk.
+**Tables:** **`usgs_myb3_production`** (Table 1 melted), **`usgs_country_mineral_facilities`** (Table 2 merged blocks). Filename pattern **`myb3-{year}-{slug}.xlsx`** → `reference_year` + ISO3 via slug map (`united-arab-emirates` → ARE, etc.). Unmapped filenames are skipped with a **partial** warning.
 
-### Files inventoried (regional / Hormuz-adjacent)
+**Parsing notes (maintain in [`loaders/load_usgs.py`](loaders/load_usgs.py)):**
 
-| File |
-|------|
-| `myb3-2019-bahrain.xlsx` |
-| `myb3-2019-iraq.xlsx` |
-| `myb3-2019-oman.xlsx` |
-| `myb3-2019-qatar.xlsx` |
-| `myb3-2019-united-arab-emirates.xlsx` |
-| `myb3-2023-iran.xlsx` |
-| `myb3-2023-saudi-arabia.xlsx` |
+- **IDE:** `.xlsx` may be hidden from workspace search — loader uses **`Path.glob("myb3*.xlsx")`**.
+- **Sheets:** `Text` skipped; resolve **`Table1` vs `Table 1`** with regex **`^table\s*1$`** (case-insensitive).
+- **Table 1:** Header row = first column starts with `Commodity`; year columns detected by 4-digit tokens; **`commodity_path`** = section (`METALS` / `INDUSTRIAL MINERALS`) + colon-branch stack + row label; footnotes in spacer columns.
+- **Table 2:** Locate Commodity / owner / location / capacity columns by **merged header text** on rows 5–6; **merged blocks** for wrapped rows; **`Continued`** in col A = continuation; chrome / subheader fragment rows skipped; **`Do.`** in commodity → **`commodity_leaf_resolved`** and **`commodity_cell_raw`** both set to the **resolved** label (no blank commodity columns); **`facility_path`** = section stack **+** commodity leaf (so it stays populated when the stack is reset for a new root product); **`do.`** in owner/location/capacity repeats last explicit value, with **flush** carrying **full merged** O/L/C for the next ditto. Canonical spec in **`load_usgs.py` module header**; regression: **`uv run python scripts/validate_myb3_table2.py`**.
+- **Reload:** `facilities` **deletes** existing `usgs_myb3_production` / `usgs_country_mineral_facilities` rows for each **`source_file`** before upsert so stale fingerprints do not leave orphan `Do.` rows. Searching **`usgs_mineral_statistics`** (MCS) for “do” mostly hits prose (“do not …”) — use **`usgs_country_mineral_facilities`** for yearbook ditto QA.
 
-### Workbook layout (consistent across these files)
-
-Each workbook has **three sheets**:
-
-1. **`Text`** — narrative; **skip** for v1 (optional later: blob table).
-2. **Table 1** — *Production of mineral commodities*: `Commodity` + **year columns** with blank spacer columns for footnotes (`r`, `e`). Section rows (`METALS`, `INDUSTRIAL MINERALS`) and hierarchical commodity lines. **Unit** appears in an early row (e.g. thousand metric tons vs metric tons — **differs by file/year**).
-3. **Table 2** — *Structure of the mineral industry*: **Commodity**, **Major operating companies and major equity owners**, **Location of main facilities**, **Annual capacity**. Rows **wrap** (continuation lines with empty commodity column). **Column count is 8 or 9** (extra blank before capacity in some files).
-
-**Sheet naming drift:** 2019 Gulf set uses **`Table1` / `Table2`**; Iran/Saudi 2023 uses **`Table 1` / `Table 2`** (space). Resolve with case-insensitive regex **`table\s*1`** and **`table\s*2`**.
-
-**Header rows:** Table 2 uses rows ~5–6 for subheaders (“Annual capacity” may sit on row 5); **do not assume fixed column indices** — locate columns by **cell text** containing `Commodity`, `Major operating`, `Location`, `capacity`.
-
-### Product decisions (for implementer)
-
-- **Ingest both** Table 1 and Table 2 (distinct from MCS CSV `usgs_mineral_statistics`).
-- **Table 1 →** proposed table **`usgs_myb3_production`** (name can be adjusted): long format after melting year columns; `reference_year` from filename; `country_iso3` from slug map (`united-arab-emirates` → ARE, etc.).
-- **Table 2 →** proposed table **`usgs_country_mineral_facilities`**: **merged facility blocks** (concatenate wrapped owner/location strings into one logical row); store **`row_start` / `row_end`** (0-based Excel row indices) and a **`record_fingerprint`** for idempotent upserts.
-- **`Do.`** in the Commodity column means **ditto**: repeat the **previous non-empty, non-`Do.` commodity label** (USGS convention). Store **`commodity_raw`** and **`commodity_resolved`** if useful for QA.
-
-### Implementation checklist
-
-1. Add **`usgs_myb3_production`** and **`usgs_country_mineral_facilities`** to `create_tables.sql` + `seed_table_catalog.sql` + Supabase migration (**RLS off** for ETL parity with other fact tables unless you add policies).
-2. Replace **`cmd_facilities`** in [`load_usgs.py`](loaders/load_usgs.py): loop `data/usgs/myb3*.xlsx`, parse both tables, upsert in batches, `finish_run` **success** with row counts.
-3. Update [README.md](README.md) schema subsection if column lists differ from the planned sketch.
-4. Optional: Cursor plan file `usgs_myb3_unblock_*.plan.md` under `~/.cursor/plans/` may exist on the machine — not required in repo.
+**Regional files in use:** Bahrain, Iraq, Oman, Qatar, UAE (2019); Iran, Saudi Arabia (2023).
 
 ---
 
@@ -160,6 +132,12 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 
 - **ProTEE:** small CSV → `cepii_protee_hs6`. **GeoDep:** chunked read of `geodep_data.csv` (~3M rows) → `cepii_geodep_import_dependence`; optional `GEODEP_HS_PREFIXES` in script to limit HS6 prefixes. Transient network errors → re-run (upsert idempotent).
 
+### USGS myb3 — [loaders/load_usgs.py](loaders/load_usgs.py) `facilities`
+
+- **Separate from MCS:** Table 1 + Table 2 live in **`usgs_myb3_production`** and **`usgs_country_mineral_facilities`**, not `usgs_mineral_statistics`.
+- **Sheet names:** regex match `table\s*1` / `table\s*2` (handles `Table1` vs `Table 1`).
+- **Table 2:** merged blocks + **`Do.`** = ditto to previous commodity cell; column positions vary (8 vs 9) — header text search, not fixed indices.
+
 ### Supabase / security
 
 - **ETL client:** `get_client()` should use the **service role** (or secret) key — it **bypasses RLS**, so pullers/loaders keep working even if some tables have RLS enabled.
@@ -176,7 +154,7 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 - **`country_macro_indicators`** / **`food_balance_sheets`** — filled by `pull_worldbank_wdi.py` and `pull_faostat.py --dataset fbs` (or `all`) after schema exists.
 - **`hs_code_lookup`** — run [pull_comtrade_hs_lookup.py](pullers/pull_comtrade_hs_lookup.py) once (or after Comtrade updates the JSON).
 - **Streamlit** — tabbed explorer (prices, BACI trade, crops, pipeline); no tabs yet for macro/FBS/energy/fertilizer, **CEPII ProTEE/GeoDep**, **`table_catalog`**, or future JODI/USGS/GEM.
-- **USGS myb3 xlsx** — files on disk; **no DDL / no real `facilities` ingest** yet — see **USGS myb3 yearbooks** above. **GEM** — no loaders/tables. **MCS CSV** — `load_usgs.py mcs` + `usgs_mineral_statistics`. **JODI** — `load_jodi.py` + `jodi_energy_observations`.
+- **GEM** — no loaders/tables. **USGS MCS CSV** — `load_usgs.py mcs` + `usgs_mineral_statistics`. **USGS myb3** — `load_usgs.py facilities` + `usgs_myb3_production` / `usgs_country_mineral_facilities` (see **USGS myb3 yearbooks**). **JODI** — `load_jodi.py` + `jodi_energy_observations`.
 - **WTFC / CHELEM zips** under `data/cepi/` — no loader (entire WTFC family deferred, including CHELEM price_range/type zips).
 - **GEM GIS `*.zip`** (geojson/gpkg) — intentionally **deferred**; tabular `.xlsx` first.
 - **Pagination / offset** for EIA/USDA when responses exceed **5000** rows (OK for current year ranges; fragile if ranges widen).
@@ -204,7 +182,7 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 5. **Verify:** `SELECT * FROM pipeline_runs ORDER BY completed_at DESC LIMIT 20;` and row counts per table.
 6. **Streamlit:** `uv run streamlit run app/streamlit_app.py` — prefer **`get_read_client()`** + anon key for anything exposed beyond localhost.
 7. **Optional:** Seed `country_lookup`; production RLS; CI / smoke tests.
-8. **Next data wave:** **GEM** loader/tables; **USGS myb3** — implement per **USGS myb3 yearbooks** (Table 1 + Table 2, merged blocks, `Do.`). **JODI:** `uv run python loaders/load_jodi.py`. **USGS MCS:** `uv run python loaders/load_usgs.py`.
+8. **Next data wave:** **GEM** loader/tables. **JODI:** `uv run python loaders/load_jodi.py`. **USGS:** `uv run python loaders/load_usgs.py mcs` (MCS CSV); **`uv run python loaders/load_usgs.py facilities`** (myb3 `*.xlsx`).
 
 ---
 
@@ -225,7 +203,8 @@ uv run python loaders/load_baci.py --all
 uv run python loaders/load_cepi_beyond_baci.py protee   # optional
 uv run python loaders/load_cepi_beyond_baci.py geodep   # optional; long
 uv run python loaders/load_jodi.py   # optional; default min year 2020
-uv run python loaders/load_usgs.py   # optional; MCS CSV under data/usgs/
+uv run python loaders/load_usgs.py mcs          # optional; MCS CSV under data/usgs/
+uv run python loaders/load_usgs.py facilities   # optional; myb3-*.xlsx under data/usgs/
 
 uv run streamlit run app/streamlit_app.py
 ```
@@ -241,7 +220,7 @@ uv run streamlit run app/streamlit_app.py
 | [schema/create_tables.sql](schema/create_tables.sql) | Full DDL + upsert `UNIQUE` targets + `table_catalog` seed |
 | [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql) | Idempotent `table_catalog` row updates only |
 | [loaders/load_cepi_beyond_baci.py](loaders/load_cepi_beyond_baci.py) | CEPII ProTEE / GeoDep loaders + dataset semantics |
-| [loaders/load_usgs.py](loaders/load_usgs.py) | USGS MCS CSV (`mcs`); myb3 stub (`facilities`) — extend per **USGS myb3 yearbooks** |
+| [loaders/load_usgs.py](loaders/load_usgs.py) | USGS MCS CSV (`mcs`); myb3 country xlsx (`facilities`) → `usgs_myb3_*` tables |
 | [README.md](README.md) | User-facing spec, puller docs, schema, HS scope, future roadmap |
 
 ---

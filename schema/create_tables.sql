@@ -230,6 +230,58 @@ CREATE INDEX IF NOT EXISTS idx_usgs_mineral_country_year
 CREATE INDEX IF NOT EXISTS idx_usgs_mineral_commodity_year
     ON usgs_mineral_statistics (commodity, data_year);
 
+-- USGS Minerals Yearbook Vol. III — country myb3-*.xlsx Table 1 (production matrix, melted).
+CREATE TABLE IF NOT EXISTS usgs_myb3_production (
+    id                      SERIAL PRIMARY KEY,
+    record_fingerprint      TEXT NOT NULL UNIQUE,
+    country_iso3            TEXT NOT NULL,
+    reference_year          INTEGER NOT NULL,
+    commodity_path          TEXT NOT NULL,
+    stat_year               INTEGER NOT NULL,
+    value_raw               TEXT,
+    value_numeric           NUMERIC,
+    footnote                TEXT,
+    unit_context            TEXT,
+    source_file             TEXT NOT NULL,
+    sheet_name              TEXT NOT NULL,
+    source                  TEXT NOT NULL,
+    pulled_at               TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_usgs_myb3_prod_country_ref
+    ON usgs_myb3_production (country_iso3, reference_year);
+
+CREATE INDEX IF NOT EXISTS idx_usgs_myb3_prod_stat_year
+    ON usgs_myb3_production (stat_year);
+
+-- USGS myb3 Table 2 — structure of mineral industry (merged facility blocks).
+CREATE TABLE IF NOT EXISTS usgs_country_mineral_facilities (
+    id                      SERIAL PRIMARY KEY,
+    record_fingerprint      TEXT NOT NULL UNIQUE,
+    country_iso3            TEXT NOT NULL,
+    reference_year          INTEGER NOT NULL,
+    commodity_cell_raw      TEXT,
+    commodity_leaf_resolved TEXT NOT NULL,
+    facility_path           TEXT NOT NULL,
+    owner_operator          TEXT,
+    location                TEXT,
+    capacity_raw            TEXT,
+    capacity_numeric        NUMERIC,
+    unit_note               TEXT,
+    sheet_name              TEXT NOT NULL,
+    excel_row_start         INTEGER NOT NULL,
+    excel_row_end           INTEGER NOT NULL,
+    source_file             TEXT NOT NULL,
+    source                  TEXT NOT NULL,
+    pulled_at               TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_usgs_facilities_country_ref
+    ON usgs_country_mineral_facilities (country_iso3, reference_year);
+
+ALTER TABLE usgs_myb3_production DISABLE ROW LEVEL SECURITY;
+ALTER TABLE usgs_country_mineral_facilities DISABLE ROW LEVEL SECURITY;
+
 CREATE INDEX IF NOT EXISTS idx_cepii_geodep_country_year
     ON cepii_geodep_import_dependence (country, data_year);
 
@@ -411,6 +463,26 @@ INSERT INTO table_catalog (
     'record_fingerprint',
     'loaders/load_usgs.py mcs',
     130
+),
+(
+    'public',
+    'usgs_myb3_production',
+    'USGS myb3 Table 1 — production by year',
+    'Melted Minerals Yearbook country xlsx Table 1: country (ISO3 from filename), reference year from filename, commodity_path (section + branch + row label), stat_year from column header, value and footnote. Distinct from MCS usgs_mineral_statistics. Upsert key record_fingerprint.',
+    'One row per country × commodity_path × stat_year × value cell.',
+    'record_fingerprint',
+    'loaders/load_usgs.py facilities',
+    135
+),
+(
+    'public',
+    'usgs_country_mineral_facilities',
+    'USGS myb3 Table 2 — mineral industry structure',
+    'Merged blocks from Minerals Yearbook Table 2: operating companies, locations, annual capacity; Do. resolved as ditto to previous commodity cell; facility_path includes colon-based hierarchy. excel_row_start/end trace source rows. Upsert record_fingerprint.',
+    'One row per merged facility block.',
+    'record_fingerprint',
+    'loaders/load_usgs.py facilities',
+    140
 )
 ON CONFLICT (table_schema, table_name) DO UPDATE SET
     title = EXCLUDED.title,

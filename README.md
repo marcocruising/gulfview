@@ -28,7 +28,7 @@ hormuz-supply-chain/
 │   ├── baci/                        # BACI CSVs → load_baci.py → bilateral_trade
 │   ├── cepi/                        # ProTEE + GeoDep CSVs; optional WTFC/CHELEM zips (no loader)
 │   ├── jodi/                        # JODI CSV exports (gas/oil); load_jodi.py → jodi_energy_observations
-│   ├── usgs/                        # MCS CSV + myb3-*.xlsx yearbooks (see HANDOVER — myb3 spec)
+│   ├── usgs/                        # MCS CSV + myb3-*.xlsx yearbooks → load_usgs.py mcs | facilities
 │   └── globalenergymonitor/         # GEM .xlsx trackers; GIS .zip bundles deferred (maps later)
 │
 ├── schema/
@@ -46,7 +46,7 @@ hormuz-supply-chain/
 │   ├── load_baci.py                 # BACI: bilateral trade flows (HS6, 200 countries)
 │   ├── load_cepi_beyond_baci.py     # CEPII ProTEE + GeoDep (elasticities & import-dependence)
 │   ├── load_jodi.py                 # JODI oil/gas CSVs → jodi_energy_observations
-│   └── load_usgs.py                 # USGS: MCS CSV → usgs_mineral_statistics; myb3 xlsx → planned tables
+│   └── load_usgs.py                 # USGS: MCS CSV → usgs_mineral_statistics; myb3 xlsx → usgs_myb3_* tables
 │
 ├── app/
 │   └── streamlit_app.py             # data explorer UI — reads from Supabase only
@@ -63,7 +63,7 @@ hormuz-supply-chain/
 | `data/baci/` | CEPII BACI yearly CSVs | **`bilateral_trade`** via [`loaders/load_baci.py`](loaders/load_baci.py) |
 | `data/cepi/` | `ProTEE_0_1.csv`, `geodep_data.csv`; optional **WTFC_HS96** / **CHELEM** zips (large) | **`cepii_protee_hs6`**, **`cepii_geodep_import_dependence`** via [`loaders/load_cepi_beyond_baci.py`](loaders/load_cepi_beyond_baci.py). **WTFC/CHELEM zips:** no loader — deferred. |
 | `data/jodi/` | Flat **CSVs** (e.g. gas `STAGING_world_NewFormat.csv`, oil `primaryyear2026.csv` — same column layout); optional `jodi-oil-country-note.xlsx` (notes) | **`jodi_energy_observations`** via [`loaders/load_jodi.py`](loaders/load_jodi.py). Gas files often span **2009–present** (~18k rows/year at steady state); the loader defaults to **`data_year >= 2020`** to match BACI-style horizons — use **`--all-years`** or **`--min-year YYYY`** to change. |
-| `data/usgs/` | **`MCS*_Commodities_Data.csv`**; regional **`myb3-{year}-{country}.xlsx`** (Minerals Yearbook Vol. III–style) | **`usgs_mineral_statistics`** via `load_usgs.py mcs` (**`cp1252`**, **`record_fingerprint`**). **`myb3`:** regional `.xlsx` files are on disk (Bahrain, Iraq, Oman, Qatar, UAE 2019; Iran, Saudi Arabia 2023) — **DDL + `facilities` loader not implemented yet**; full parse spec is in [HANDOVER.md](HANDOVER.md) **USGS myb3 yearbooks**. Cursor may not list `.xlsx` in search; use **`Path.glob("myb3*.xlsx")`** or the OS folder. |
+| `data/usgs/` | **`MCS*_Commodities_Data.csv`**; regional **`myb3-{year}-{country}.xlsx`** (Minerals Yearbook Vol. III–style) | **`usgs_mineral_statistics`** via `load_usgs.py mcs` (**`cp1252`**, **`record_fingerprint`**). **`usgs_myb3_production`** + **`usgs_country_mineral_facilities`** via **`load_usgs.py facilities`** (Table 1 melt + Table 2 merged blocks, **`Do.`** ditto). Regional files: Bahrain, Iraq, Oman, Qatar, UAE (2019); Iran, Saudi Arabia (2023). Cursor may omit `.xlsx` from search — use **`Path.glob("myb3*.xlsx")`** or the OS folder. Details: [HANDOVER.md](HANDOVER.md) **USGS myb3 yearbooks**. |
 | `data/globalenergymonitor/` | **`.xlsx`** trackers (LNG, GOGPT, pipelines summaries, etc.) | **Not loaded yet.** Planned: tabular GEM loader(s). **`.zip` GIS** (`.geojson`/`.gpkg`): **out of scope for first pass** — keep files for a later PostGIS / map phase. |
 
 **`table_catalog`** ([`schema/seed_table_catalog.sql`](schema/seed_table_catalog.sql)) describes existing tables; add rows when new tables land (e.g. GEM).
@@ -362,18 +362,60 @@ source                      TEXT
 pulled_at                   TIMESTAMPTZ
 ```
 
-#### USGS `myb3-*.xlsx` yearbooks (planned — not in `create_tables.sql` yet)
+#### USGS `myb3-*.xlsx` yearbooks
 
-Minerals Yearbook **country tables-only** releases. Each workbook has **three sheets**: narrative **`Text`** (skip for v1), **Table 1** / **`Table 1`** (production of mineral commodities — wide by year), and **Table 2** / **`Table 2`** (structure of the mineral industry — companies, locations, capacities). **Sheet names differ** (`Table1` vs `Table 1`); discover with a case-insensitive `table\s*1` / `table\s*2` match.
+Minerals Yearbook **country tables-only** releases. Each workbook has **three sheets**: narrative **`Text`** (skipped), **Table 1** (production — wide by year), **Table 2** (structure of the industry). **Sheet names differ** (`Table1` vs `Table 1`); the loader matches **`^table\s*1$`** / **`^table\s*2$`** case-insensitively.
 
-**Planned targets for the next implementation pass:**
+**Loader:** `uv run python loaders/load_usgs.py facilities` — globs **`data/usgs/myb3*.xlsx`**.
 
-| Source | Intended table | Grain / notes |
-|--------|----------------|---------------|
-| Table 1 | `usgs_myb3_production` (name TBD) | Long format: country (from filename) × commodity × **stat_year** × value; melt year columns; footnotes `r` / `e` in spacer columns. Distinct from MCS `usgs_mineral_statistics`. |
-| Table 2 | `usgs_country_mineral_facilities` | **Merged blocks:** concatenate wrapped owner/location lines into one row per facility; store **`row_start` / `row_end`** for audit. Find **Commodity / Major operating companies / Location / Annual capacity** columns by **header text** (column count is **8 or 9**). **`Do.`** = *ditto* — repeat the **previous non-`Do.` commodity** label in column 0. |
+| Source | Table | Grain / notes |
+|--------|-------|---------------|
+| Table 1 | `usgs_myb3_production` | Long rows: **melt** year columns; **`commodity_path`** (section + hierarchy); footnotes **`r` / `e`**; distinct from MCS `usgs_mineral_statistics`. |
+| Table 2 | `usgs_country_mineral_facilities` | **Merged blocks** (wrapped owner/location concatenated); **`excel_row_start` / `excel_row_end`** (0-based sheet rows); columns found by **header text** (8 or 9 cols). **`Do.`** = ditto → **`commodity_leaf_resolved`** from previous non-`Do.` commodity cell. |
 
-**Filename pattern:** `myb3-{reference_year}-{slug}.xlsx` → map slug to ISO3 (e.g. `united-arab-emirates` → ARE).
+**Filename:** `myb3-{reference_year}-{slug}.xlsx` → slug map to ISO3 (e.g. `united-arab-emirates` → ARE). Unmapped slugs → run ends **partial** for that file.
+
+`usgs_myb3_production`:
+
+```
+record_fingerprint   TEXT UNIQUE
+country_iso3         TEXT
+reference_year       INTEGER
+commodity_path       TEXT
+stat_year            INTEGER
+value_raw            TEXT
+value_numeric        NUMERIC
+footnote             TEXT
+unit_context         TEXT
+source_file          TEXT
+sheet_name           TEXT
+source               TEXT
+pulled_at            TIMESTAMPTZ
+```
+
+`usgs_country_mineral_facilities`:
+
+```
+record_fingerprint         TEXT UNIQUE
+country_iso3               TEXT
+reference_year             INTEGER
+commodity_cell_raw         TEXT
+commodity_leaf_resolved    TEXT
+facility_path              TEXT
+owner_operator             TEXT
+location                   TEXT
+capacity_raw               TEXT
+capacity_numeric           NUMERIC
+unit_note                  TEXT
+sheet_name                 TEXT
+excel_row_start            INTEGER
+excel_row_end              INTEGER
+source_file                TEXT
+source                     TEXT
+pulled_at                  TIMESTAMPTZ
+```
+
+**`commodity_cell_raw` / `commodity_leaf_resolved`:** For USGS **`Do.`** rows both hold the **resolved** commodity text (same value) so nothing is blank in the UI.
 
 ---
 
@@ -626,6 +668,8 @@ uv run python loaders/load_cepi_beyond_baci.py all
 
 Optional: set `GEODEP_HS_PREFIXES` in the script (same idea as `HS_CODES` in `load_baci.py`) to load only products under selected HS prefixes and shrink runtime.
 
+**Known limitation:** Large GeoDep uploads may hit transient HTTP/TLS errors; re-run — upserts are idempotent.
+
 ### `load_jodi.py` — JODI oil and gas CSVs
 
 **Source:** JODI — manual CSV export (same column layout for oil and gas products).  
@@ -650,12 +694,10 @@ uv run python loaders/load_jodi.py --min-year 2018
 ```bash
 uv run python loaders/load_usgs.py           # default: mcs
 uv run python loaders/load_usgs.py mcs --file MCS2026_Commodities_Data.csv
-uv run python loaders/load_usgs.py facilities   # stub: logs partial until myb3 ingest is implemented (see HANDOVER)
+uv run python loaders/load_usgs.py facilities   # myb3-*.xlsx → usgs_myb3_production + usgs_country_mineral_facilities
 ```
 
-**myb3 xlsx (facilities subcommand):** Spec is documented in [HANDOVER.md](HANDOVER.md) **USGS myb3 yearbooks** (sheet layout, `Do.`, merged blocks, planned table names). Implement there next; extend [`schema/create_tables.sql`](schema/create_tables.sql), [`schema/seed_table_catalog.sql`](schema/seed_table_catalog.sql), and [`loaders/load_usgs.py`](loaders/load_usgs.py) `cmd_facilities`.
-
-**Known limitation:** Large GeoDep uploads may hit transient HTTP/TLS errors; re-run — upserts are idempotent.
+**myb3 xlsx (`facilities`):** Ingests all matching workbooks under `data/usgs/`. Semantics and edge cases: [HANDOVER.md](HANDOVER.md) **USGS myb3 yearbooks**. Schema: [`schema/create_tables.sql`](schema/create_tables.sql); catalog: [`schema/seed_table_catalog.sql`](schema/seed_table_catalog.sql). After changing the parser, run **`uv run python scripts/validate_myb3_table2.py`** (ditto expansion in O/L/C, commodity `Do.` replay, **`commodity_cell_raw`** matches **`commodity_leaf_resolved`** on ditto rows, idempotent re-parse).
 
 ---
 
@@ -678,8 +720,9 @@ uv run python loaders/load_baci.py --all
 # 4b. Optional — CEPII ProTEE + GeoDep CSVs in data/cepi/ (see Loaders section)
 # uv run python loaders/load_cepi_beyond_baci.py all
 
-# 4c. Optional — USGS MCS CSV in data/usgs/
-# uv run python loaders/load_usgs.py
+# 4c. Optional — USGS in data/usgs/
+# uv run python loaders/load_usgs.py mcs
+# uv run python loaders/load_usgs.py facilities   # myb3-*.xlsx
 
 # 5. Run remaining pullers (FAOSTAT --dataset all needs FAO API creds for the fertilizer leg; use --dataset crops|fbs to skip)
 uv run python pullers/pull_eia.py
@@ -701,7 +744,7 @@ uv run streamlit run app/streamlit_app.py
 | `load_baci.py` | Annually, when CEPII releases new year |
 | `load_cepi_beyond_baci.py` | When CEPII refreshes ProTEE / GeoDep CSVs |
 | `load_jodi.py` | When you refresh JODI CSV exports under `data/jodi/` |
-| `load_usgs.py` | New MCS CSV; after myb3 ingest lands, re-run when `myb3-*.xlsx` change under `data/usgs/` |
+| `load_usgs.py` | New MCS CSV (`mcs`); when `myb3-*.xlsx` change, re-run `facilities` |
 | `pull_eia.py` | Monthly |
 | `pull_faostat.py` | Annually; `--dataset` crops / fertilizer / fbs / all (FBS bulk is large) |
 | `pull_worldbank.py` | Monthly |
@@ -753,7 +796,7 @@ The app should read Supabase settings from `.env` via python-dotenv — use `get
 | Petrochemicals excluded | Plastics and chemicals exposure not mapped | Add HS 2901-2902, 3901-3904 in v2 |
 | Exposure scores not computed | Raw data only, no derived Hormuz dependency index | Build iteratively once data is validated |
 | Pink Sheet XLSX URL can 404 after WB republish | Pull fails until `PINK_SHEET_MONTHLY_XLSX_URL` is updated; check `pipeline_runs.error_message` | Manual URL refresh from World Bank doc page (script logs instructions) |
-| USGS myb3 xlsx not ingested | No yearbook Table 1/2 rows in Postgres | Implement per [HANDOVER.md](HANDOVER.md) **USGS myb3 yearbooks** — tables `usgs_myb3_production` + `usgs_country_mineral_facilities`, `load_usgs.py facilities` |
+| USGS myb3 not loaded | Empty `usgs_myb3_*` tables | Place `myb3-*.xlsx` under `data/usgs/` and run `uv run python loaders/load_usgs.py facilities` |
 | GEM on disk not in Postgres | Cannot query GEM trackers in SQL | Add DDL + tabular loader(s) per [HANDOVER.md](HANDOVER.md) |
 | JODI gas CSV is long history | Large row count if you use `--all-years` | Default `load_jodi.py` keeps `data_year >= 2020` (~39% of current gas export); override with `--min-year` / `--all-years` |
 

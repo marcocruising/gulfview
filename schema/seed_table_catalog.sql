@@ -162,6 +162,26 @@ INSERT INTO table_catalog (
     'record_fingerprint',
     'loaders/load_usgs.py mcs',
     130
+),
+(
+    'public',
+    'usgs_myb3_production',
+    'USGS myb3 Table 1 — production by year',
+    'Melted Minerals Yearbook country xlsx Table 1: country (ISO3 from filename), reference year from filename, commodity_path (section + branch + row label), stat_year from column header, value and footnote. Distinct from MCS usgs_mineral_statistics. Upsert key record_fingerprint.',
+    'One row per country × commodity_path × stat_year × value cell.',
+    'record_fingerprint',
+    'loaders/load_usgs.py facilities',
+    135
+),
+(
+    'public',
+    'usgs_country_mineral_facilities',
+    'USGS myb3 Table 2 — mineral industry structure',
+    'Merged blocks from Minerals Yearbook Table 2: operating companies, locations, annual capacity; Do. resolved as ditto to previous commodity cell; facility_path includes colon-based hierarchy. excel_row_start/end trace source rows. Upsert record_fingerprint.',
+    'One row per merged facility block.',
+    'record_fingerprint',
+    'loaders/load_usgs.py facilities',
+    140
 )
 ON CONFLICT (table_schema, table_name) DO UPDATE SET
     title = EXCLUDED.title,

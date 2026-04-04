@@ -9,13 +9,67 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import altair as alt
 import pandas as pd
+import pycountry
 import streamlit as st
 from supabase import Client
 
 from utils.supabase_client import get_client, get_read_client
 
 PAGE_SIZE = 1000
+
+
+def _st_altair_bar_h_by_value(
+    df: pd.DataFrame,
+    value_col: str,
+    label_col: str,
+    *,
+    x_title: str | None = None,
+    row_height: int = 30,
+    sort_by: str | None = None,
+    value_format: str = ",.0f",
+) -> None:
+    """Horizontal bars with categories ordered by value (desc). `st.bar_chart` sorts the y-axis A–Z."""
+    sort_field = sort_by or value_col
+    need = {label_col, value_col, sort_field}
+    missing = need - set(df.columns)
+    if missing:
+        raise ValueError(f"_st_altair_bar_h_by_value: missing columns {missing}")
+    d = df[list(need)].copy()
+    h = max(200, row_height * len(d))
+    xt = x_title if x_title is not None else value_col
+    # Vega-Lite hides alternating labels by default when it thinks they overlap; disable that
+    # and allow long "Country (XXX)" strings so every row is labeled.
+    y_axis = alt.Axis(
+        labelOverlap=False,
+        labelLimit=900,
+        labelPadding=6,
+        title=None,
+    )
+    if sort_field == value_col:
+        y_enc: Any = alt.Y(f"{label_col}:N", sort="-x", axis=y_axis)
+    else:
+        y_enc = alt.Y(
+            f"{label_col}:N",
+            sort=alt.EncodingSortField(field=sort_field, op="max", order="descending"),
+            axis=y_axis,
+        )
+    chart = (
+        alt.Chart(d)
+        .mark_bar()
+        .encode(
+            x=alt.X(f"{value_col}:Q", title=xt),
+            y=y_enc,
+            tooltip=[
+                alt.Tooltip(f"{label_col}:N", title=""),
+                alt.Tooltip(f"{value_col}:Q", format=value_format, title=xt),
+            ],
+        )
+        .properties(height=h, padding={"left": 24})
+        .configure_axisY(labelAlign="right", labelBaseline="middle")
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 
 def _client() -> Client:
@@ -91,6 +145,91 @@ def load_pipeline_runs() -> pd.DataFrame:
 def load_hs_lookup() -> pd.DataFrame:
     sb = supabase()
     return pd.DataFrame(fetch_all_pages(sb, "hs_code_lookup", "*", order_by="hs6_code"))
+
+
+@st.cache_data(ttl=300)
+def hs6_description_map() -> dict[str, str]:
+    """HS6 code → English description from `hs_code_lookup` (Comtrade reference)."""
+    df = load_hs_lookup()
+    if df.empty or "hs6_code" not in df.columns or "description" not in df.columns:
+        return {}
+    out: dict[str, str] = {}
+    for _, r in df.iterrows():
+        code = str(r["hs6_code"]).strip()
+        d = r.get("description")
+        if not code:
+            continue
+        out[code] = str(d).strip() if pd.notna(d) and str(d).strip() else ""
+    return out
+
+
+def hs6_full_description(code: object) -> str:
+    if code is None or (isinstance(code, float) and pd.isna(code)):
+        return ""
+    return hs6_description_map().get(str(code).strip(), "")
+
+
+_HS6_SELECT_DESC_MAX = 88
+
+
+def hs6_select_label(code: object, *, max_desc: int = _HS6_SELECT_DESC_MAX) -> str:
+    """Selectbox: `270900 — Crude oils…` (truncated)."""
+    if code is None or (isinstance(code, float) and pd.isna(code)):
+        return ""
+    c = str(code).strip()
+    if not c:
+        return ""
+    d = hs6_description_map().get(c, "")
+    if not d:
+        return c
+    if len(d) > max_desc:
+        d = d[: max_desc - 1] + "…"
+    return f"{c} — {d}"
+
+
+def hs6_chart_label(code: object, *, max_total: int = 72) -> str:
+    """Chart axis: compact `code — desc`."""
+    lab = hs6_select_label(code, max_desc=max(24, max_total - len(str(code).strip()) - 3))
+    if len(lab) > max_total:
+        return lab[: max_total - 1] + "…"
+    return lab
+
+
+def filter_hs6_codes_by_search(codes: list[str], query: str) -> list[str]:
+    """Keep codes where the query appears in the HS6 digits or in the lookup description."""
+    q = query.strip().lower()
+    if not q:
+        return list(codes)
+    m = hs6_description_map()
+    out: list[str] = []
+    for h in codes:
+        hs = str(h).strip()
+        if q in hs.lower():
+            out.append(hs)
+            continue
+        if q in m.get(hs, "").lower():
+            out.append(hs)
+    return out
+
+
+def _series_hs6_labels(s: pd.Series, *, max_total: int = 72) -> pd.Series:
+    return s.map(lambda x: hs6_chart_label(x, max_total=max_total) if pd.notna(x) and str(x).strip() else "")
+
+
+def _merge_hs6_description_column(df: pd.DataFrame, col: str = "hs6_code") -> pd.DataFrame:
+    """Add `description` next to an hs6 column when missing."""
+    if df.empty or col not in df.columns:
+        return df
+    if "description" in df.columns:
+        return df
+    m = hs6_description_map()
+    out = df.copy()
+    out["description"] = out[col].astype(str).map(lambda c: m.get(str(c).strip(), ""))
+    idx = list(out.columns).index(col) + 1
+    # move description immediately after hs6_code
+    cols = [c for c in out.columns if c != "description"]
+    cols = cols[:idx] + ["description"] + cols[idx:]
+    return out[cols]
 
 
 def _price_date_column(df: pd.DataFrame) -> pd.Series:
@@ -173,6 +312,56 @@ def load_country_lookup() -> pd.DataFrame:
     return pd.DataFrame(fetch_all_pages(sb, "country_lookup", "*", order_by="iso3"))
 
 
+@st.cache_data(ttl=300)
+def _lookup_iso3_to_name() -> dict[str, str]:
+    """ISO3 → preferred display name from `country_lookup` when seeded."""
+    df = load_country_lookup()
+    if df.empty or "iso3" not in df.columns or "country_name" not in df.columns:
+        return {}
+    out: dict[str, str] = {}
+    for _, r in df.iterrows():
+        k = str(r["iso3"]).strip().upper()
+        v = r.get("country_name")
+        if k and pd.notna(v) and str(v).strip():
+            out[k] = str(v).strip()
+    return out
+
+
+def country_display_name(iso3: object) -> str:
+    """Resolve ISO 3166-1 alpha-3 to a common English name (DB override, then pycountry)."""
+    if iso3 is None or (isinstance(iso3, float) and pd.isna(iso3)):
+        return ""
+    raw = str(iso3).strip()
+    code = raw.upper()
+    if len(code) != 3 or not code.isalpha():
+        return raw
+    m = _lookup_iso3_to_name()
+    if code in m:
+        return m[code]
+    try:
+        c = pycountry.countries.get(alpha_3=code)
+        if c:
+            return str(c.name)
+    except (LookupError, KeyError, TypeError, AttributeError):
+        pass
+    return code
+
+
+def country_select_label(iso3: object) -> str:
+    """Selectbox / chart axis: 'United States (USA)' when resolvable, else code."""
+    if iso3 is None or (isinstance(iso3, float) and pd.isna(iso3)):
+        return ""
+    code = str(iso3).strip().upper()
+    name = country_display_name(iso3)
+    if name == code or not name:
+        return code
+    return f"{name} ({code})"
+
+
+def _series_country_labels(s: pd.Series) -> pd.Series:
+    return s.map(lambda x: country_select_label(x) if pd.notna(x) and str(x).strip() else "")
+
+
 def explore_table_catalog() -> None:
     st.subheader("Data dictionary")
     st.caption("What each table is for: title, grain, keys, maintainer.")
@@ -208,7 +397,7 @@ def explore_energy() -> None:
     products = sorted(df["product"].dropna().astype(str).unique())
     c1, c2, c3 = st.columns(3)
     with c1:
-        r = st.selectbox("Reporter (ISO3)", reporters, key="em_eia_rep")
+        r = st.selectbox("Reporter", reporters, format_func=country_select_label, key="em_eia_rep")
     with c2:
         ft = st.selectbox("Flow type", flows, key="em_eia_flow")
     with c3:
@@ -258,12 +447,16 @@ def explore_fertilizer() -> None:
         sub.groupby("country", as_index=False)["value_tonnes"]
         .sum()
         .nlargest(20, "value_tonnes")
-        .sort_values("value_tonnes", ascending=True)
     )
-    st.caption("Top **20** countries by **value_tonnes**")
-    st.bar_chart(top.set_index("country")["value_tonnes"], horizontal=True)
+    st.caption("Top **20** countries by **value_tonnes** (largest at top)")
+    top_chart = top.assign(_lbl=_series_country_labels(top["country"]))
+    _st_altair_bar_h_by_value(top_chart, "value_tonnes", "_lbl", x_title="Tonnes")
     with st.expander("Raw rows (this slice)"):
-        st.dataframe(sub.sort_values("country"), use_container_width=True, hide_index=True)
+        disp = sub.sort_values("country").copy()
+        if "country" in disp.columns:
+            i = list(disp.columns).index("country") + 1
+            disp.insert(i, "country_name", _series_country_labels(disp["country"]))
+        st.dataframe(disp, use_container_width=True, hide_index=True)
 
 
 def explore_macro() -> None:
@@ -276,7 +469,7 @@ def explore_macro() -> None:
     inds = sorted(df["indicator"].dropna().astype(str).unique())
     c1, c2 = st.columns(2)
     with c1:
-        c = st.selectbox("Country (ISO3)", countries, key="em_mac_c")
+        c = st.selectbox("Country", countries, format_func=country_select_label, key="em_mac_c")
     with c2:
         ind = st.selectbox("Indicator", inds, key="em_mac_i")
     sub = df[(df["country"].astype(str) == c) & (df["indicator"].astype(str) == ind)].copy()
@@ -285,7 +478,7 @@ def explore_macro() -> None:
         st.warning("No rows for this country and indicator.")
         return
     unit = sub["unit"].dropna().astype(str).iloc[-1] if sub["unit"].notna().any() else ""
-    st.caption(f"Unit: **{unit}**")
+    st.caption(f"**{country_display_name(c)}** (`{c}`) · unit: **{unit}**")
     line = sub.set_index("data_year")[["value"]].astype(float)
     st.line_chart(line, height=350)
     with st.expander("Raw rows"):
@@ -328,16 +521,21 @@ def explore_fbs() -> None:
             sub.groupby("country", as_index=False)["value"]
             .sum()
             .nlargest(20, "value")
-            .sort_values("value", ascending=True)
         )
-        st.bar_chart(top.set_index("country")["value"], horizontal=True)
+        top_c = top.assign(_lbl=_series_country_labels(top["country"]))
+        st.caption("Top **20** countries · bars sorted by value (largest at top).")
+        _st_altair_bar_h_by_value(top_c, "value", "_lbl", x_title="Tonnes")
         with st.expander("Raw rows (this slice)"):
-            st.dataframe(sub.sort_values("country"), use_container_width=True, hide_index=True)
+            d0 = sub.sort_values("country").copy()
+            if "country" in d0.columns:
+                j = list(d0.columns).index("country") + 1
+                d0.insert(j, "country_name", _series_country_labels(d0["country"]))
+            st.dataframe(d0, use_container_width=True, hide_index=True)
     else:
         countries = sorted(df["country"].dropna().astype(str).unique())
         c1, c2, c3 = st.columns(3)
         with c1:
-            ctry = st.selectbox("Country (ISO3)", countries, key="em_fbs_c2")
+            ctry = st.selectbox("Country", countries, format_func=country_select_label, key="em_fbs_c2")
         with c2:
             com = st.selectbox("Commodity", commodities, key="em_fbs_c3")
         with c3:
@@ -350,6 +548,7 @@ def explore_fbs() -> None:
         if sub.empty:
             st.warning("No rows for this selection.")
             return
+        st.caption(f"**{country_display_name(ctry)}** (`{ctry}`)")
         line = sub.set_index("data_year")[["value"]].astype(float)
         st.line_chart(line, height=350)
         with st.expander("Raw rows"):
@@ -358,39 +557,78 @@ def explore_fbs() -> None:
 
 def explore_protee() -> None:
     st.subheader("CEPII ProTEE (HS6 elasticities)")
-    st.caption("Import-demand elasticities — **not** trade flows. HS revision in data (often HS2007).")
+    st.caption(
+        "Import-demand elasticities — **not** trade flows. HS revision in data (often HS2007). "
+        "Descriptions come from **`hs_code_lookup`** (same as BACI labels)."
+    )
     df = load_cepii_protee_hs6()
     if df.empty:
         st.info("No rows in `cepii_protee_hs6`.")
         return
-    prefix = st.text_input("HS6 prefix (optional, e.g. 2709)", value="", key="em_pt_prefix").strip()
-    sub = df[df["hs6_code"].astype(str).str.startswith(prefix)] if prefix else df
+    c1, c2 = st.columns(2)
+    with c1:
+        prefix = st.text_input("HS6 prefix (optional, e.g. 2709)", value="", key="em_pt_prefix").strip()
+    with c2:
+        kw = st.text_input(
+            "Keyword in description (optional, e.g. petroleum, urea)",
+            value="",
+            key="em_pt_kw",
+        ).strip().lower()
+    sub = df[df["hs6_code"].astype(str).str.startswith(prefix)] if prefix else df.copy()
+    if kw:
+        m = hs6_description_map()
+        sub = sub[
+            sub["hs6_code"]
+            .astype(str)
+            .map(lambda c: kw in str(c).lower() or kw in m.get(str(c).strip(), "").lower())
+        ]
     if sub.empty:
-        st.warning("No rows match this prefix.")
+        st.warning("No rows match this filter.")
         return
     work = sub.dropna(subset=["trade_elasticity"]).copy()
     if work.empty:
         st.warning("No numeric elasticities in this slice.")
         return
     work["_abs"] = work["trade_elasticity"].abs()
-    top = work.nlargest(15, "_abs").sort_values("trade_elasticity", ascending=True)
-    st.markdown("**Largest |elasticity| (15 HS6 codes, signed)**")
-    st.bar_chart(top.set_index("hs6_code")["trade_elasticity"], horizontal=True)
-    with st.expander("Filtered table"):
-        st.dataframe(sub.sort_values("hs6_code"), use_container_width=True, hide_index=True)
+    top = work.nlargest(15, "_abs")
+    st.markdown("**Largest |elasticity| (15 HS6 codes, signed)** — ranked by magnitude, largest at top")
+    top_l = top.assign(
+        _lbl=_series_hs6_labels(top["hs6_code"], max_total=76),
+        _sort_abs=top["trade_elasticity"].abs(),
+    )
+    _st_altair_bar_h_by_value(
+        top_l,
+        "trade_elasticity",
+        "_lbl",
+        x_title="Elasticity",
+        sort_by="_sort_abs",
+        value_format=",.4f",
+    )
+    with st.expander("Filtered table (HS6 + description)"):
+        disp = _merge_hs6_description_column(sub.sort_values("hs6_code"))
+        st.dataframe(disp, use_container_width=True, hide_index=True)
 
 
 def explore_geodep() -> None:
     st.subheader("CEPII GeoDep (import dependence)")
-    st.caption("Large table — enter **country (ISO3)** and/or **year**, optional HS6 prefix, and a row cap.")
+    st.caption(
+        "Large table — filter by **ISO3** (e.g. SAU) and/or **year**. "
+        "Names in charts use pycountry; seed `country_lookup` to override labels."
+    )
     cty = st.text_input("Country (ISO3), optional", value="", key="em_geo_c").strip().upper()
+    if len(cty) == 3 and cty.isalpha():
+        st.caption(f"Showing codes for **{country_display_name(cty)}** (`{cty}`)")
     year_token = st.selectbox(
         "Year",
         ["any", "2019", "2020", "2021", "2022", "2023", "2024"],
         index=0,
         key="em_geo_y",
     )
-    hs6p = st.text_input("HS6 prefix (optional)", value="", key="em_geo_hs").strip()
+    hs6p = st.text_input(
+        "HS6 prefix (optional, digits only — narrows SQL query)",
+        value="",
+        key="em_geo_hs",
+    ).strip()
     row_limit = st.slider(
         "Max rows fetched",
         min_value=100,
@@ -410,11 +648,26 @@ def explore_geodep() -> None:
     top_hs = df.head(20).copy()
     if top_hs["import_value"].notna().any():
         st.markdown("**First 20 rows in this slice — import_value**")
-        lbl = top_hs["country"].astype(str) + " · " + top_hs["hs6_code"].astype(str)
-        chart = pd.Series(top_hs["import_value"].astype(float).values, index=lbl)
-        st.bar_chart(chart, horizontal=True)
+        lbl = (
+            top_hs["country"].map(country_select_label).astype(str)
+            + " · "
+            + _series_hs6_labels(top_hs["hs6_code"], max_total=68)
+        )
+        gviz = pd.DataFrame(
+            {"_lbl": lbl.values, "import_value": top_hs["import_value"].astype(float).values}
+        )
+        _st_altair_bar_h_by_value(gviz, "import_value", "_lbl", x_title="import_value")
     with st.expander("Raw rows"):
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        gd = df.copy()
+        if "country" in gd.columns:
+            gd.insert(
+                list(gd.columns).index("country") + 1,
+                "country_name",
+                _series_country_labels(gd["country"]),
+            )
+        if "hs6_code" in gd.columns:
+            gd = _merge_hs6_description_column(gd, "hs6_code")
+        st.dataframe(gd, use_container_width=True, hide_index=True)
 
 
 def explore_country_lookup() -> None:
@@ -490,21 +743,74 @@ def tab_prices() -> None:
 
 def tab_who_trades() -> None:
     st.subheader("Who trades what")
-    st.caption("BACI trade values are **USD thousands** (same convention as CEPII / README).")
+    st.caption(
+        "BACI trade values are **USD thousands** (same convention as CEPII / README). "
+        "HS6 labels use **`hs_code_lookup`** — run `pull_comtrade_hs_lookup.py` if descriptions are missing."
+    )
     df = load_bilateral_slim()
     if df.empty:
         st.info("No rows in `bilateral_trade`.")
         return
     hs_list = sorted(df["hs6_code"].dropna().astype(str).unique().tolist())
     years = sorted(df["data_year"].dropna().astype(int).unique().tolist())
+    hs_search = st.text_input(
+        "Search HS6 (digits and/or words from the product name, e.g. `2709`, `crude`, `urea`)",
+        value="",
+        key="trade_hs_q",
+        help="Narrows the dropdown. Matches the six-digit code substring or any text in the Comtrade description.",
+    )
+    hs_filtered = filter_hs6_codes_by_search(hs_list, hs_search)
+    if not hs_filtered:
+        st.warning("No HS6 codes in BACI match this search. Clear the search or try other keywords.")
+        return
+    view_mode = st.radio(
+        "View",
+        ["Single HS6 product", "Aggregate all search matches"],
+        horizontal=True,
+        key="trade_view_mode",
+        help="Single: one six-digit line. Aggregate: sum trade across every HS6 that matches your search (e.g. “cereal” clumps all matching products).",
+    )
     c1, c2 = st.columns(2)
     with c1:
-        hs = st.selectbox("HS6 code", hs_list, key="trade_hs")
+        if view_mode == "Single HS6 product":
+            hs = st.selectbox(
+                "HS6 product",
+                hs_filtered,
+                format_func=hs6_select_label,
+                key="trade_hs",
+            )
+        else:
+            hs = None
+            st.metric("HS6 codes in aggregate", len(hs_filtered))
     with c2:
         year = st.selectbox("Year", years, index=len(years) - 1, key="trade_year")
-    slice_df = df[(df["hs6_code"].astype(str) == str(hs)) & (df["data_year"] == year)]
+    if view_mode == "Single HS6 product":
+        full_hs = hs6_full_description(hs)
+        if full_hs:
+            st.caption(f"**{hs}** — {full_hs}")
+        else:
+            st.caption(f"`{hs}` — *(no description in lookup)*")
+        slice_df = df[(df["hs6_code"].astype(str) == str(hs)) & (df["data_year"] == year)]
+    else:
+        q = hs_search.strip()
+        if not q and len(hs_filtered) == len(hs_list):
+            st.warning(
+                "Aggregate mode with an **empty** search would sum **every** HS6 in BACI — add a search "
+                "term (e.g. `cereal`, `1001`) or switch to **Single HS6 product**."
+            )
+            return
+        filt_note = repr(q) if q else "codes matched by filter"
+        st.caption(
+            f"**Aggregate** — summing **{len(hs_filtered)}** HS6 line(s) for **{year}** (search: {filt_note})."
+        )
+        if len(hs_filtered) > 80:
+            with st.expander("HS6 codes included (first 80)"):
+                st.write(", ".join(sorted(hs_filtered)[:80]) + (" …" if len(hs_filtered) > 80 else ""))
+        slice_df = df[
+            (df["hs6_code"].astype(str).isin(hs_filtered)) & (df["data_year"] == year)
+        ]
     if slice_df.empty:
-        st.warning("No rows for this HS code and year.")
+        st.warning("No rows for this selection and year.")
         return
     tv = slice_df["trade_value_usd"].fillna(0)
     slice_df = slice_df.assign(_tv=tv)
@@ -513,28 +819,34 @@ def tab_who_trades() -> None:
         .sum()
         .nlargest(10, "_tv")
         .rename(columns={"exporter": "country", "_tv": "trade_value_usd_thousands"})
-        .sort_values("trade_value_usd_thousands", ascending=True)
+        .sort_values("trade_value_usd_thousands", ascending=False)
     )
     imp = (
         slice_df.groupby("importer", as_index=False)["_tv"]
         .sum()
         .nlargest(10, "_tv")
         .rename(columns={"importer": "country", "_tv": "trade_value_usd_thousands"})
-        .sort_values("trade_value_usd_thousands", ascending=True)
+        .sort_values("trade_value_usd_thousands", ascending=False)
     )
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("**Top 10 exporters** (by trade value, USD thousands)")
+        st.markdown("**Top 10 exporters** (by trade value, USD thousands — largest first)")
         if exp.empty:
             st.info("No exporter data.")
         else:
-            st.bar_chart(exp.set_index("country")["trade_value_usd_thousands"], horizontal=True)
+            ex2 = exp.assign(_lbl=_series_country_labels(exp["country"]))
+            _st_altair_bar_h_by_value(
+                ex2, "trade_value_usd_thousands", "_lbl", x_title="USD thousands"
+            )
     with col2:
-        st.markdown("**Top 10 importers** (by trade value, USD thousands)")
+        st.markdown("**Top 10 importers** (by trade value, USD thousands — largest first)")
         if imp.empty:
             st.info("No importer data.")
         else:
-            st.bar_chart(imp.set_index("country")["trade_value_usd_thousands"], horizontal=True)
+            im2 = imp.assign(_lbl=_series_country_labels(imp["country"]))
+            _st_altair_bar_h_by_value(
+                im2, "trade_value_usd_thousands", "_lbl", x_title="USD thousands"
+            )
 
 
 def tab_country_profile() -> None:
@@ -559,9 +871,10 @@ def tab_country_profile() -> None:
     years = sorted(df["data_year"].dropna().astype(int).unique().tolist())
     c1, c2 = st.columns(2)
     with c1:
-        country = st.selectbox("Country (ISO3)", countries, key="prof_country")
+        country = st.selectbox("Country", countries, format_func=country_select_label, key="prof_country")
     with c2:
         year = st.selectbox("Year", years, index=len(years) - 1, key="prof_year")
+    st.caption(f"**{country_display_name(country)}** (`{country}`) · **{year}**")
     imp = (
         df[(df["importer"].astype(str) == country) & (df["data_year"] == year)]
         .groupby("hs6_code", as_index=False)["trade_value_usd"]
@@ -579,8 +892,26 @@ def tab_country_profile() -> None:
     merged["description"] = merged["hs6_code"].astype(str).map(
         lambda h: desc_map.get(str(h).strip(), "")
     )
-    merged = merged[["hs6_code", "description", "imports_usd_k", "exports_usd_k"]]
-    st.dataframe(merged, use_container_width=True, hide_index=True)
+    hs_filt = st.text_input(
+        "Filter products (HS6 digits or words in the description, e.g. `1001`, `wheat`, `fertilizer`)",
+        value="",
+        key="prof_hs_q",
+    ).strip().lower()
+    if hs_filt:
+        dcol = merged["description"].fillna("").astype(str).str.lower()
+        ccol = merged["hs6_code"].astype(str).str.lower()
+        merged = merged[dcol.str.contains(hs_filt, regex=False) | ccol.str.contains(hs_filt, regex=False)]
+    merged["product"] = merged.apply(
+        lambda r: (
+            f"{r['hs6_code']} — {r['description']}"
+            if str(r.get("description", "")).strip()
+            else str(r["hs6_code"])
+        ),
+        axis=1,
+    )
+    show = merged[["product", "hs6_code", "description", "imports_usd_k", "exports_usd_k"]]
+    st.caption(f"**{len(show)}** product row(s) · sortable columns; use your browser search (Ctrl/Cmd+F) inside the table if needed.")
+    st.dataframe(show, use_container_width=True, hide_index=True)
 
 
 def tab_crop_rank() -> None:
@@ -624,14 +955,10 @@ def tab_crop_rank() -> None:
         st.warning("No rows for this selection.")
         return
     unit = sub["unit"].dropna().astype(str).iloc[-1] if sub["unit"].notna().any() else ""
-    top = (
-        sub.groupby("country", as_index=False)["value"]
-        .sum()
-        .nlargest(20, "value")
-        .sort_values("value", ascending=True)
-    )
-    st.caption(f"Year **{year}** · unit: **{unit}** · top **20** countries by value")
-    st.bar_chart(top.set_index("country")["value"], horizontal=True)
+    top = sub.groupby("country", as_index=False)["value"].sum().nlargest(20, "value")
+    st.caption(f"Year **{year}** · unit: **{unit}** · top **20** by value (largest at top)")
+    top_cr = top.assign(_lbl=_series_country_labels(top["country"]))
+    _st_altair_bar_h_by_value(top_cr, "value", "_lbl", x_title=unit or "Value")
 
 
 def tab_pipeline() -> None:

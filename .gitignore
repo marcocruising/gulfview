@@ -13,3 +13,7 @@ uv.lock.bak
 # BACI CSVs are large — keep data/baci/ in repo via .gitkeep only
 data/baci/*
 !data/baci/.gitkeep
+
+# CEPI CSVs are large — same pattern
+data/cepi/*
+!data/cepi/.gitkeep

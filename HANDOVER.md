@@ -26,9 +26,9 @@ Additional keys:
 
 - `EIA_API_KEY` — [pullers/pull_eia.py](pullers/pull_eia.py)
 - `USDA_FAS_API_KEY` — [pullers/pull_usda_psd.py](pullers/pull_usda_psd.py)
-- **FAOSTAT fertilizer API** — [pullers/pull_faostat.py](pullers/pull_faostat.py): `FAOSTAT_API_TOKEN` *or* `FAOSTAT_USERNAME` + `FAOSTAT_PASSWORD` (required for `--dataset fertilizer` / `--dataset all` fertilizer leg). Optional: `FAOSTAT_FERTILIZER_API_CODE` (default `RFN`; try `RFB` for product-level), `FAOSTAT_API_PAGE_LIMIT`, `FAOSTAT_ZIP_PATH` (crop bulk only).
+- **FAOSTAT fertilizer API** — [pullers/pull_faostat.py](pullers/pull_faostat.py): `FAOSTAT_API_TOKEN` *or* `FAOSTAT_USERNAME` + `FAOSTAT_PASSWORD` (required for `--dataset fertilizer` / `--dataset all` fertilizer leg). Optional: `FAOSTAT_FERTILIZER_API_CODE` (default **`RFB`**; **`RFN`** = by nutrient), `FAOSTAT_API_PAGE_LIMIT`, `FAOSTAT_API_AREA_CHUNK`, `FAOSTAT_API_SLEEP_SEC`, `FAOSTAT_API_AREAS` (comma-separated FAO area codes), `FAOSTAT_ZIP_PATH` (crop bulk only).
 
-Never commit `.env`. Do not print API keys in tracebacks or `HTTPError` URLs; redact in logs where possible.
+Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (placeholders only); rotate any secret that was ever committed there. Do not print API keys in tracebacks or `HTTPError` URLs; redact in logs where possible.
 
 ---
 
@@ -61,7 +61,9 @@ Never commit `.env`. Do not print API keys in tracebacks or `HTTPError` URLs; re
 
 - **Crops:** bulk normalized ZIP (same as before). Optional **`FAOSTAT_ZIP_PATH`** to skip download.
 - **Fertilizers:** **`faostat`** package → FAOSTAT REST API (`get_data_df`), **not** the Inputs Fertilizers bulk URL. Bulk fertilizer ZIPs are often **CloudFront/geo or rate blocked**; the API avoids that path but **requires FAO API credentials** (JWT or username/password — see `.env.example`).
-- Default API dataset code **`RFN`**; **`RFB`** = fertilizers *by product* and often matches urea/DAP/MAP item labels better. **`FAOSTAT_FERTILIZER_API_CODE`** env overrides.
+- **`pars={'area': 'all'}` is invalid** — the API returns an **empty** frame. The puller loads **FAO country area codes** from `get_par_df(dataset, 'area')` (rows with `aggregate_type == '0'`), then queries in **chunks** of **`FAOSTAT_API_AREA_CHUNK`** (default 40) with **`year`** = configured **`YEARS`**, optional **`FAOSTAT_API_SLEEP_SEC`** between chunks, optional **`FAOSTAT_API_AREAS`** to restrict codes.
+- Default API dataset code **`RFB`** (*by product*). **`RFN`** = *by nutrient*; switch with **`FAOSTAT_FERTILIZER_API_CODE`** if you extend item mapping.
+- Rows use the **`Area`** (country name) column mapped to **ISO3** via `pycountry` (plus a small skip list for composite labels). M49 column is used when present.
 - **`--dataset crops` | `fertilizer` | `all`:** run each leg independently so retries do not re-stream crops. With `--dataset all`, if fertilizer fails, **`pipeline_runs`** is **`partial`**, crops still written, error message explains fertilizer (intentional).
 - **`faostat.set_requests_args`** mutates global client state — call **once** per process (the package appends `lang/` to its base URL if invoked repeatedly).
 
@@ -93,13 +95,14 @@ Never commit `.env`. Do not print API keys in tracebacks or `HTTPError` URLs; re
 4. **Supabase upsert batches** must not contain **duplicate rows for the same unique constraint** in one POST.
 5. **Pink Sheet URL** and **EIA routes** are **external drift** risks — failures are often “update constant / facet / path”, not “random bug”.
 6. **FAOSTAT `faostat` client:** do not call **`set_requests_args`** multiple times in one process (package bug: **`__BASE_URL__`** keeps growing).
+7. **FAOSTAT fertilizer API:** **`pars={'area': 'all'}`** (or similar) returns **no rows** — the puller must send **explicit FAO area codes** in chunks (see script).
 
 ---
 
 ## Next steps (suggested order)
 
 1. **BACI (if not done):** CEPII files → `data/baci/` → `uv run python loaders/load_baci.py --all` (or `--year YYYY`).
-2. **FAOSTAT fertilizer:** Register / obtain **FAOSTAT API** credentials → add to `.env` → `uv run python pullers/pull_faostat.py --dataset fertilizer` (retry without re-pulling crops). Use **`FAOSTAT_FERTILIZER_API_CODE=RFB`** if `RFN` yields no rows after filters.
+2. **FAOSTAT fertilizer:** Register / obtain **FAOSTAT API** credentials → add to **`.env` only** → `uv run python pullers/pull_faostat.py --dataset fertilizer` (retry without re-pulling crops). Default code is **`RFB`**; use **`RFN`** only if you need nutrient-level series and adjust filters.
 3. **Verify DB:** `SELECT * FROM pipeline_runs ORDER BY completed_at DESC LIMIT 20;` and row counts per table.
 4. **Streamlit:** Run `uv run streamlit run app/streamlit_app.py`, align with README explorer spec, wire **`get_read_client()`** if using anon in the UI.
 5. **Reference data:** Seed `hs_code_lookup` and `country_lookup` (Gulf producer flags per README).

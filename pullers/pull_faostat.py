@@ -17,9 +17,10 @@ FAOSTAT_PRODUCTION_ZIP = (
     "https://bulks-faostat.fao.org/production/"
     "Production_Crops_Livestock_E_All_Data_(Normalized).zip"
 )
-# FAOSTAT API dataset code (env FAOSTAT_FERTILIZER_API_CODE). RFN = by nutrient; RFB = by product (often better for urea/DAP/MAP).
-FAOSTAT_FERTILIZER_API_CODE_DEFAULT = "RFN"
+# FAOSTAT API dataset code (env FAOSTAT_FERTILIZER_API_CODE). RFB = by product; RFN = by nutrient (N/P/K).
+FAOSTAT_FERTILIZER_API_CODE_DEFAULT = "RFB"
 FAOSTAT_API_PAGE_LIMIT_DEFAULT = 50_000
+FAOSTAT_API_AREA_CHUNK_DEFAULT = 40
 CHUNK_ROWS = 80000
 # -------------------------------------------------------------
 
@@ -28,6 +29,7 @@ import io
 import os
 import re
 import sys
+import time
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -69,6 +71,45 @@ def _m49_to_iso3(raw: object) -> str | None:
         return c.alpha_3 if c else None
     except (LookupError, KeyError, TypeError, AttributeError):
         return None
+
+
+# FAOSTAT composite / special area labels that pycountry cannot map cleanly — skip row.
+_FAO_AREA_LABEL_SKIP = frozenset(
+    {
+        "belgium-luxembourg",
+        "china, hong kong sar",
+        "china, macao sar",
+        "melanesia",
+        "micronesia",
+        "polynesia",
+    }
+)
+
+
+def _area_label_to_iso3(label: object) -> str | None:
+    """Map FAOSTAT `Area` column (country name) to ISO3."""
+    if label is None or (isinstance(label, float) and pd.isna(label)):
+        return None
+    s = str(label).strip()
+    if not s:
+        return None
+    low = s.lower()
+    if low in _FAO_AREA_LABEL_SKIP:
+        return None
+    try:
+        c = pycountry.countries.get(name=s)
+        if c:
+            return str(c.alpha_3)
+    except (KeyError, LookupError, TypeError, AttributeError):
+        pass
+    try:
+        return str(pycountry.countries.search_fuzzy(s)[0].alpha_3)
+    except LookupError:
+        pass
+    if "," in s:
+        return _area_label_to_iso3(s.split(",")[0].strip())
+    return None
+
 
 
 def _load_zip_bytes(url: str, env_path_var: str) -> bytes:
@@ -208,7 +249,23 @@ def _configure_faostat_api() -> None:
         )
 
 
+def _fertilizer_fao_area_codes(dataset_code: str) -> list[str]:
+    """FAOSTAT `area` parameter values (FAO geographic codes), not the string 'all'."""
+    import faostat
+
+    raw = (os.environ.get("FAOSTAT_API_AREAS") or "").strip()
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    adf = faostat.get_par_df(dataset_code, "area")
+    countries = adf[adf["aggregate_type"] == "0"]
+    return [str(c).strip() for c in countries["code"].tolist()]
+
+
 def _fetch_fertilizer_api_df() -> pd.DataFrame:
+    """
+    Query fertilizer dataset in chunks: pars={'area': [...], 'year': [...]}.
+    The API does not treat area='all' as valid — it returns an empty frame.
+    """
     import faostat
 
     code = (
@@ -216,26 +273,47 @@ def _fetch_fertilizer_api_df() -> pd.DataFrame:
     ).strip()
     raw_limit = os.environ.get("FAOSTAT_API_PAGE_LIMIT")
     limit = int(raw_limit) if raw_limit else FAOSTAT_API_PAGE_LIMIT_DEFAULT
-    return faostat.get_data_df(
-        code,
-        pars={"area": "all"},
-        strval=False,
-        limit=limit,
-    )
+    chunk_env = os.environ.get("FAOSTAT_API_AREA_CHUNK")
+    chunk_sz = int(chunk_env) if chunk_env else FAOSTAT_API_AREA_CHUNK_DEFAULT
+    sleep_s = float(os.environ.get("FAOSTAT_API_SLEEP_SEC", "0.2"))
+
+    years = [str(y) for y in YEARS]
+    areas = _fertilizer_fao_area_codes(code)
+    if not areas:
+        raise RuntimeError("No FAO area codes resolved for fertilizer API (empty FAOSTAT_API_AREAS?).")
+
+    parts: list[pd.DataFrame] = []
+    n_chunks = (len(areas) + chunk_sz - 1) // chunk_sz
+    for i in tqdm(range(0, len(areas), chunk_sz), desc="FAOSTAT fertilizer API", total=n_chunks):
+        chunk = areas[i : i + chunk_sz]
+        df = faostat.get_data_df(
+            code,
+            pars={"area": chunk, "year": years},
+            strval=False,
+            limit=limit,
+        )
+        if not df.empty:
+            parts.append(df)
+        if sleep_s > 0 and i + chunk_sz < len(areas):
+            time.sleep(sleep_s)
+
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True)
 
 
 def _process_fertilizer_api_df(df: pd.DataFrame, pulled_at: str) -> list[dict[str, Any]]:
     if df.empty:
         return []
     canon = _canon_columns(df)
-    m49 = _pick_col(canon, "area code (m49)")
+    m49c = _pick_col(canon, "area code (m49)")
+    area_c = _pick_col(canon, "area")
     item_c = _pick_col(canon, "item")
     elem_c = _pick_col(canon, "element")
     year_c = _pick_col(canon, "year")
     value_c = _pick_col(canon, "value")
     unit_c = _pick_col(canon, "unit")
     missing = [n for n, c in [
-        ("Area Code (M49)", m49),
         ("Item", item_c),
         ("Element", elem_c),
         ("Year", year_c),
@@ -246,13 +324,22 @@ def _process_fertilizer_api_df(df: pd.DataFrame, pulled_at: str) -> list[dict[st
             "Unexpected FAOSTAT API columns; missing: "
             f"{missing}. Got columns: {list(df.columns)}"
         )
+    if not m49c and not area_c:
+        raise RuntimeError(
+            "Unexpected FAOSTAT API columns: need 'Area' or 'Area Code (M49)'. "
+            f"Got: {list(df.columns)}"
+        )
 
     work = df.copy()
     work[year_c] = pd.to_numeric(work[year_c], errors="coerce")
     work = work[work[year_c].isin(YEARS)]
     fert_rows: list[dict[str, Any]] = []
     for _, r in work.iterrows():
-        iso3 = _m49_to_iso3(r.get(m49))
+        iso3: str | None = None
+        if m49c:
+            iso3 = _m49_to_iso3(r.get(m49c))
+        if not iso3 and area_c:
+            iso3 = _area_label_to_iso3(r.get(area_c))
         if not iso3:
             continue
         item = r.get(item_c)
@@ -353,6 +440,7 @@ def main() -> int:
     code = (
         os.environ.get("FAOSTAT_FERTILIZER_API_CODE") or FAOSTAT_FERTILIZER_API_CODE_DEFAULT
     ).strip()
+    chunk_sz = int(os.environ["FAOSTAT_API_AREA_CHUNK"]) if os.environ.get("FAOSTAT_API_AREA_CHUNK") else FAOSTAT_API_AREA_CHUNK_DEFAULT
     run_id = start_run(
         client,
         SCRIPT_NAME,
@@ -362,6 +450,7 @@ def main() -> int:
             "dataset": args.dataset,
             "crop_zip": FAOSTAT_PRODUCTION_ZIP,
             "fertilizer_api_code": code if args.dataset in ("fertilizer", "all") else None,
+            "fertilizer_area_chunk": chunk_sz if args.dataset in ("fertilizer", "all") else None,
         },
     )
 
@@ -389,8 +478,8 @@ def main() -> int:
         else:
             if not fert_rows:
                 fert_error = (
-                    "Fertilizer API returned no rows after V1 filters "
-                    "(item/element/year/units). Try FAOSTAT_FERTILIZER_API_CODE=RFB for product-level data."
+                    "Fertilizer API returned no rows after V1 filters (item/element/year/units). "
+                    "If using RFN, try FAOSTAT_FERTILIZER_API_CODE=RFB; widen YEARS or check FAOSTAT layout."
                 )
 
     if crop_rows:

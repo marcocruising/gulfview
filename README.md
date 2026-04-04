@@ -86,6 +86,8 @@ SUPABASE_ANON_PUBLIC_KEY=...
 
 **Read-only UI** (e.g. Streamlit against RLS-protected data) can use `get_read_client()` with **`SUPABASE_ANON_PUBLIC_KEY`** or **`SUPABASE_PUBLISHABLE_KEY`**.
 
+**FAOSTAT fertilizer pull** needs **`FAOSTAT_API_TOKEN`** (or username/password) in `.env`; optional tuning vars are listed in [`.env.example`](.env.example). Keep secrets out of `.env.example`.
+
 ### 3. Initialise the database
 
 Run the schema file once against your Supabase project:
@@ -281,7 +283,13 @@ uv run python pullers/pull_eia.py
 
 **Crops (`crop_production`):** Bulk normalized ZIP over HTTP (`Production_Crops_Livestock_E_All_Data_(Normalized).zip`). No FAO account required. Optional local file: set **`FAOSTAT_ZIP_PATH`** to skip the download.
 
-**Fertilizers (`fertilizer_production`):** Uses the **`faostat`** Python package and the **FAOSTAT REST API** (`faostat.get_data_df`), not the bulk ZIP. The **Inputs Fertilizers** bulk URL is often **CloudFront/geo or rate blocked** in some networks; the API route avoids that. **FAOSTAT API v2 requires credentials:** set **`FAOSTAT_API_TOKEN`** (JWT) or **`FAOSTAT_USERNAME`** + **`FAOSTAT_PASSWORD`** in `.env` (see [`.env.example`](.env.example)). Dataset code defaults to **`RFN`**; set **`FAOSTAT_FERTILIZER_API_CODE=RFB`** if you need *fertilizers by product* (urea, DAP, MAP, etc.) and `RFN` yields no rows after filters. Optional **`FAOSTAT_API_PAGE_LIMIT`** (default `50000`) controls API pagination batch size.
+**Fertilizers (`fertilizer_production`):** Uses the **`faostat`** Python package and the **FAOSTAT REST API** (`faostat.get_data_df`), not the bulk ZIP. The **Inputs Fertilizers** bulk URL is often **CloudFront/geo or rate blocked**; the API avoids that. **FAOSTAT API v2 requires credentials:** **`FAOSTAT_API_TOKEN`** (JWT) or **`FAOSTAT_USERNAME`** + **`FAOSTAT_PASSWORD`** in `.env` (see [`.env.example`](.env.example)).
+
+**Important API detail:** The server does **not** accept `area=all` as a literal filter — it returns an **empty** result. The puller loads **FAO country area codes** from the API metadata (`aggregate_type` country rows), requests **`pars={'area': [...], 'year': [...]}`** in **chunks** (default **40** areas per call, **`FAOSTAT_API_AREA_CHUNK`**), and maps the **`Area`** name column to **ISO3** (with **`FAOSTAT_API_AREAS`** to override the code list if needed). **`FAOSTAT_API_SLEEP_SEC`** (default `0.2`) spaces out chunk requests.
+
+Dataset code defaults to **`RFB`** (*fertilizers by product* — urea, DAP, MAP, etc.). Set **`FAOSTAT_FERTILIZER_API_CODE=RFN`** for *by nutrient* (N/P/K) if you extend the item mapping. **`FAOSTAT_API_PAGE_LIMIT`** (default `50000`) is the per-request pagination page size inside the `faostat` client.
+
+**Never put real tokens in `.env.example`** — placeholders only; rotate any token that was ever committed there.
 
 **CLI — run datasets independently** (avoids re-streaming crops when only fertilizer needs a retry):
 
@@ -408,7 +416,7 @@ uv run python loaders/load_baci.py --all
 
 # 4. Run all pullers
 uv run python pullers/pull_eia.py
-uv run python pullers/pull_faostat.py
+uv run python pullers/pull_faostat.py --dataset all
 uv run python pullers/pull_worldbank.py
 uv run python pullers/pull_usda_psd.py
 
@@ -424,7 +432,7 @@ uv run streamlit run app/streamlit_app.py
 |---|---|
 | `load_baci.py` | Annually, when CEPII releases new year |
 | `pull_eia.py` | Monthly |
-| `pull_faostat.py` | Annually (or when FAO releases updates) |
+| `pull_faostat.py` | Annually (or when FAO releases updates); `--dataset` to refresh crops, fertilizer, or both |
 | `pull_worldbank.py` | Monthly |
 | `pull_usda_psd.py` | Monthly |
 
@@ -474,7 +482,7 @@ The app should read Supabase settings from `.env` via python-dotenv — use `get
 | Gap | Impact | Planned fix |
 |---|---|---|
 | FAOSTAT crop data lags 18-24 months | Production figures are not current year | Supplement with USDA PSD (more timely) |
-| FAOSTAT fertilizer bulk ZIP blocked in some environments | `fertilizer_production` empty without API path | Use `faostat` API + FAO credentials; run `--dataset fertilizer` |
+| FAOSTAT fertilizer bulk ZIP blocked; API needs real `area`/`year` params | Empty frames if `area` is wrong (e.g. string `all`) | Puller chunks FAO area codes + years; use API + credentials; `--dataset fertilizer` |
 | Fertilizer consumption by crop not available | Cannot directly link fertilizer imports to specific crops | Requires IFA reports — manual for now |
 | No vessel-level Hormuz transit data | Cannot count actual tankers transiting | Use EIA factsheet numbers as static reference |
 | BACI is annual only | No monthly trade flow granularity | Add Comtrade API in v2 for recent months |

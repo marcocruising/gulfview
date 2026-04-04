@@ -11,6 +11,8 @@ This note is for the next agent or developer picking up the repo. The canonical 
 - **Rule:** Pullers/loaders write to Supabase; the Streamlit app should read only (see README).
 - **`table_catalog`:** Reference rows describing every application table (purpose, grain, keys, scripts). Seeded from SQL; update [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql) when you add tables.
 
+**Planned loaders (not in repo yet — resume here):** DDL + scripts for **JODI** (`data/jodi/*.csv` → `jodi_energy_observations`), **USGS** (`MCS2026_Commodities_Data.csv` → `usgs_mineral_statistics`; standardised `myb3-*.xlsx` → `usgs_country_mineral_facilities`), **GEM** (`data/globalenergymonitor/*.xlsx` only — skip `*.zip` GIS for v1). Extend `create_tables.sql`, `seed_table_catalog.sql`, and `pipeline_runs`. Details and design notes: Cursor plan *USGS JODI GEM upload* (if available) and [README.md](README.md) **Local data folders**.
+
 **Pullers (all log `pipeline_runs`):**
 
 | Script | Tables |
@@ -120,13 +122,15 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 
 ## Omissions / not done yet
 
-- **`bilateral_trade`** — populated after BACI CSVs are under `data/baci/` and `load_baci.py` runs.
+- **`bilateral_trade`** — empty until BACI CSVs are under `data/baci/` and `load_baci.py` runs (often already done in a working env).
 - **`fertilizer_production`** — needs **FAOSTAT API** credentials and `pull_faostat.py --dataset fertilizer` (or `all`). Without them, `all` ends **`partial`** but crops (and FBS) still load.
 - **`country_lookup`** — schema only; no puller yet (optional manual seed for names / Gulf flags).
 - **`country_macro_indicators`** / **`food_balance_sheets`** — filled by `pull_worldbank_wdi.py` and `pull_faostat.py --dataset fbs` (or `all`) after schema exists.
 - **`hs_code_lookup`** — run [pull_comtrade_hs_lookup.py](pullers/pull_comtrade_hs_lookup.py) once (or after Comtrade updates the JSON).
-- **Streamlit** — tabbed explorer (prices, BACI trade, crops, pipeline); no tabs yet for macro/FBS/energy/fertilizer tables or **CEPII ProTEE/GeoDep** tables.
-- **WTFC / CHELEM zips** under `data/cepi/` — no loader; see README.
+- **Streamlit** — tabbed explorer (prices, BACI trade, crops, pipeline); no tabs yet for macro/FBS/energy/fertilizer, **CEPII ProTEE/GeoDep**, **`table_catalog`**, or future JODI/USGS/GEM.
+- **JODI / USGS / GEM** — files live under `data/jodi/`, `data/usgs/`, `data/globalenergymonitor/`; **no loaders or tables yet** (see **Planned loaders** above).
+- **WTFC / CHELEM zips** under `data/cepi/` — no loader (entire WTFC family deferred, including CHELEM price_range/type zips).
+- **GEM GIS `*.zip`** (geojson/gpkg) — intentionally **deferred**; tabular `.xlsx` first.
 - **Pagination / offset** for EIA/USDA when responses exceed **5000** rows (OK for current year ranges; fragile if ranges widen).
 
 ---
@@ -152,6 +156,7 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 5. **Verify:** `SELECT * FROM pipeline_runs ORDER BY completed_at DESC LIMIT 20;` and row counts per table.
 6. **Streamlit:** `uv run streamlit run app/streamlit_app.py` — prefer **`get_read_client()`** + anon key for anything exposed beyond localhost.
 7. **Optional:** Seed `country_lookup`; production RLS; CI / smoke tests.
+8. **Next data wave:** Implement **JODI** + **USGS** + **GEM** loaders and tables (see **Planned loaders** and README **Local data folders**).
 
 ---
 

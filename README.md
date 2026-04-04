@@ -25,10 +25,11 @@ hormuz-supply-chain/
 ├── .gitignore
 │
 ├── data/
-│   ├── baci/                        # manually downloaded BACI CSV files go here
-│   │   └── .gitkeep
-│   └── cepi/                        # other CEPII CSVs (ProTEE, GeoDep) and optional WTFC/CHELEM zips
-│       └── .gitkeep
+│   ├── baci/                        # BACI CSVs → load_baci.py → bilateral_trade
+│   ├── cepi/                        # ProTEE + GeoDep CSVs; optional WTFC/CHELEM zips (no loader)
+│   ├── jodi/                        # JODI CSV exports (gas/oil); loaders planned — see below
+│   ├── usgs/                        # MCS CSV + standardised per-country yearbook xlsx; loaders planned
+│   └── globalenergymonitor/         # GEM .xlsx trackers; GIS .zip bundles deferred (maps later)
 │
 ├── schema/
 │   └── create_tables.sql            # full Supabase schema — run once
@@ -52,6 +53,18 @@ hormuz-supply-chain/
     ├── supabase_client.py           # shared Supabase connection
     └── pipeline_logger.py           # shared pipeline run logging
 ```
+
+### Local data folders — what is loaded vs planned
+
+| Folder | Contents | Supabase today |
+|--------|----------|----------------|
+| `data/baci/` | CEPII BACI yearly CSVs | **`bilateral_trade`** via [`loaders/load_baci.py`](loaders/load_baci.py) |
+| `data/cepi/` | `ProTEE_0_1.csv`, `geodep_data.csv`; optional **WTFC_HS96** / **CHELEM** zips (large) | **`cepii_protee_hs6`**, **`cepii_geodep_import_dependence`** via [`loaders/load_cepi_beyond_baci.py`](loaders/load_cepi_beyond_baci.py). **WTFC/CHELEM zips:** no loader — deferred. |
+| `data/jodi/` | Flat **CSVs** (e.g. gas `STAGING_world_NewFormat.csv`, oil `primaryyear2026.csv` — same column layout); optional `jodi-oil-country-note.xlsx` (notes) | **Not loaded yet.** Planned: **`jodi_energy_observations`** + `load_jodi.py` (separate from EIA `energy_trade_flows`). |
+| `data/usgs/` | **`MCS2026_Commodities_Data.csv`** (country × mineral × statistic — use for top producers, Gulf filters); standardised **`myb3-*.xlsx`** per country (**facility names + owners**) | **Not loaded yet.** Planned: **`usgs_mineral_statistics`**, **`usgs_country_mineral_facilities`** + `load_usgs.py`. MCS needs **`latin-1`** (or `cp1252`) when reading CSV. |
+| `data/globalenergymonitor/` | **`.xlsx`** trackers (LNG, GOGPT, pipelines summaries, etc.) | **Not loaded yet.** Planned: tabular GEM loader(s). **`.zip` GIS** (`.geojson`/`.gpkg`): **out of scope for first pass** — keep files for a later PostGIS / map phase. |
+
+**`table_catalog`** ([`schema/seed_table_catalog.sql`](schema/seed_table_catalog.sql)) describes existing tables; add rows when JODI/USGS/GEM tables land.
 
 ---
 
@@ -665,6 +678,7 @@ The app should read Supabase settings from `.env` via python-dotenv — use `get
 | Petrochemicals excluded | Plastics and chemicals exposure not mapped | Add HS 2901-2902, 3901-3904 in v2 |
 | Exposure scores not computed | Raw data only, no derived Hormuz dependency index | Build iteratively once data is validated |
 | Pink Sheet XLSX URL can 404 after WB republish | Pull fails until `PINK_SHEET_MONTHLY_XLSX_URL` is updated; check `pipeline_runs.error_message` | Manual URL refresh from World Bank doc page (script logs instructions) |
+| JODI / USGS / GEM on disk not in Postgres | Cannot query those sources in SQL or Streamlit yet | Add DDL + loaders per [HANDOVER.md](HANDOVER.md) **Planned loaders** |
 
 ---
 

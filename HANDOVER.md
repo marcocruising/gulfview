@@ -9,6 +9,27 @@ This note is for the next agent or developer picking up the repo. The canonical 
 - **Stack:** Python 3.11+ (repo uses uv), Supabase (Postgres), `pandas` / `requests` / `openpyxl`, `pycountry`, `faostat` (FAO API for fertilizer pull), optional Streamlit.
 - **Layout:** [pullers/](pullers/) (API/file pulls), [loaders/](loaders/) (manual files), [schema/create_tables.sql](schema/create_tables.sql), [utils/](utils/) (Supabase client + `pipeline_runs` logging).
 - **Rule:** Pullers/loaders write to Supabase; the Streamlit app should read only (see README).
+- **`table_catalog`:** Reference rows describing every application table (purpose, grain, keys, scripts). Seeded from SQL; update [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql) when you add tables.
+
+**Pullers (all log `pipeline_runs`):**
+
+| Script | Tables |
+|--------|--------|
+| [pull_eia.py](pullers/pull_eia.py) | `energy_trade_flows` |
+| [pull_faostat.py](pullers/pull_faostat.py) | `crop_production`, `fertilizer_production`, `food_balance_sheets` (`--dataset` crops / fertilizer / fbs / all) |
+| [pull_worldbank.py](pullers/pull_worldbank.py) | `commodity_prices` |
+| [pull_worldbank_wdi.py](pullers/pull_worldbank_wdi.py) | `country_macro_indicators` |
+| [pull_usda_psd.py](pullers/pull_usda_psd.py) | `crop_production` |
+| [pull_comtrade_hs_lookup.py](pullers/pull_comtrade_hs_lookup.py) | `hs_code_lookup` |
+
+**Loaders (all log `pipeline_runs`):**
+
+| Script | Tables |
+|--------|--------|
+| [load_baci.py](loaders/load_baci.py) | `bilateral_trade` |
+| [load_cepi_beyond_baci.py](loaders/load_cepi_beyond_baci.py) | `cepii_protee_hs6`, `cepii_geodep_import_dependence` |
+
+**CEPII beyond BACI (what it is vs `bilateral_trade`):** BACI = reconciled **bilateral flows** (exporter, importer, HS6, value, qty). **ProTEE** = one row per HS6 **import-demand elasticity** + flags (not flows; HS **2007** in CEPII’s file). **GeoDep** = importer × HS6 × year **dependence diagnostics** (HHI, persistence, top supplier code) derived from BACI — not a replacement for flow-level rows. **WTFC/CHELEM zips** in `data/cepi/` are documented in [README.md](README.md) but have **no loader** yet (huge HS96 CSVs). Full semantics: module docstring in `load_cepi_beyond_baci.py` and README **Loaders** subsection.
 
 ---
 
@@ -40,6 +61,12 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 - **Pagination:** follow `pages` in the first JSON object until done; `per_page=20000` is enough for `country/all` × multi-year pulls in practice.
 - **Country filter:** keep only rows where `countryiso3code` is a **real ISO3** (`pycountry.countries.get(alpha_3=...)`), so WB regions (AFE, WLD, …) drop out.
 - **Writes:** `country_macro_indicators` with upsert on `(country, indicator, data_year)`.
+
+### UN Comtrade HS lookup — [pullers/pull_comtrade_hs_lookup.py](pullers/pull_comtrade_hs_lookup.py)
+
+- **URL:** `https://comtrade.un.org/data/cache/classificationHS.json` — single JSON with `results[]`; each HS6 row has `id` (six digits) and `text` (`CODE - description`).
+- **Filter:** keep entries where `id` is six digits; skip chapters/headings.
+- **`category`:** optional column filled from the same V1 prefix list as BACI (`HS_PREFIX_CATEGORY` in script).
 
 ### World Bank Pink Sheet — [pullers/pull_worldbank.py](pullers/pull_worldbank.py)
 
@@ -79,19 +106,28 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 
 - Discovers `BACI_HS*_Y*.csv` with **`rglob`** under [data/baci/](data/baci/) so CEPII’s versioned subfolders work. No matching files → clear error and **`pipeline_runs`**.
 
+### CEPII ProTEE / GeoDep — [loaders/load_cepi_beyond_baci.py](loaders/load_cepi_beyond_baci.py)
+
+- **ProTEE:** small CSV → `cepii_protee_hs6`. **GeoDep:** chunked read of `geodep_data.csv` (~3M rows) → `cepii_geodep_import_dependence`; optional `GEODEP_HS_PREFIXES` in script to limit HS6 prefixes. Transient network errors → re-run (upsert idempotent).
+
 ### Supabase / security
 
-- Tables are in **`public`** with **RLS off** (intentional for service-role ETL). Supabase linter flags **RLS disabled** — acceptable only if **anon** is never given broad access. If Streamlit ships to the internet with the **anon** key, add **RLS + policies** before launch.
+- **ETL client:** `get_client()` should use the **service role** (or secret) key — it **bypasses RLS**, so pullers/loaders keep working even if some tables have RLS enabled.
+- **Legacy posture:** tables created only from [schema/create_tables.sql](schema/create_tables.sql) had **RLS off** by design. If new tables (e.g. `country_macro_indicators`, `food_balance_sheets`) were created via **Dashboard / MCP** with RLS **on**, either add policies for read paths or disable RLS on those tables to match the rest of `public`.
+- Supabase linter flags **RLS disabled** — acceptable only if **anon** is never given broad access. If Streamlit ships to the internet with the **anon** key, add **RLS + policies** before launch.
 
 ---
 
 ## Omissions / not done yet
 
-- **`bilateral_trade`** — populated after BACI CSVs are under `data/baci/` and `load_baci.py` runs (may already be done in your fork).
-- **`fertilizer_production`** — requires **FAO API login** (or token) and a successful `pull_faostat.py --dataset fertilizer` (or `all`). Without credentials, expect **`partial`** on combined runs.
-- **`hs_code_lookup`** / **`country_lookup`** — schema exists; **seeding** not part of the initial pipeline pass (optional for UX and joins).
-- **Streamlit** — [app/streamlit_app.py](app/streamlit_app.py) exists; confirm it matches README filters, uses the right `get_client` / `get_read_client`, and works against current RLS posture.
-- **Pagination / offset** for EIA/USDA when responses exceed **5000** rows (currently OK for configured year ranges but fragile if ranges widen).
+- **`bilateral_trade`** — populated after BACI CSVs are under `data/baci/` and `load_baci.py` runs.
+- **`fertilizer_production`** — needs **FAOSTAT API** credentials and `pull_faostat.py --dataset fertilizer` (or `all`). Without them, `all` ends **`partial`** but crops (and FBS) still load.
+- **`country_lookup`** — schema only; no puller yet (optional manual seed for names / Gulf flags).
+- **`country_macro_indicators`** / **`food_balance_sheets`** — filled by `pull_worldbank_wdi.py` and `pull_faostat.py --dataset fbs` (or `all`) after schema exists.
+- **`hs_code_lookup`** — run [pull_comtrade_hs_lookup.py](pullers/pull_comtrade_hs_lookup.py) once (or after Comtrade updates the JSON).
+- **Streamlit** — tabbed explorer (prices, BACI trade, crops, pipeline); no tabs yet for macro/FBS/energy/fertilizer tables or **CEPII ProTEE/GeoDep** tables.
+- **WTFC / CHELEM zips** under `data/cepi/` — no loader; see README.
+- **Pagination / offset** for EIA/USDA when responses exceed **5000** rows (OK for current year ranges; fragile if ranges widen).
 
 ---
 
@@ -109,12 +145,13 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 
 ## Next steps (suggested order)
 
-1. **BACI (if not done):** CEPII files → `data/baci/` → `uv run python loaders/load_baci.py --all` (or `--year YYYY`).
-2. **FAOSTAT fertilizer:** Register / obtain **FAOSTAT API** credentials → add to **`.env` only** → `uv run python pullers/pull_faostat.py --dataset fertilizer` (retry without re-pulling crops). Default code is **`RFB`**; use **`RFN`** only if you need nutrient-level series and adjust filters.
-3. **Verify DB:** `SELECT * FROM pipeline_runs ORDER BY completed_at DESC LIMIT 20;` and row counts per table.
-4. **Streamlit:** Run `uv run streamlit run app/streamlit_app.py`, align with README explorer spec, wire **`get_read_client()`** if using anon in the UI.
-5. **Reference data:** Seed `hs_code_lookup` and `country_lookup` (Gulf producer flags per README).
-6. **Production hardening:** RLS policies if anon access; optional CI (`ruff`, `uv sync --locked`) and smoke tests for pullers (mock HTTP or small fixtures).
+1. **Schema:** Apply [schema/create_tables.sql](schema/create_tables.sql) (SQL Editor, `psql`, or Supabase **`apply_migration`** via MCP if configured).
+2. **HS reference:** `uv run python pullers/pull_comtrade_hs_lookup.py` (Comtrade JSON → `hs_code_lookup`).
+3. **BACI:** CEPII CSVs → `data/baci/` → `uv run python loaders/load_baci.py --all` (or `--year YYYY`).
+4. **Pullers:** Run the rest per [README — Running Everything](README.md#running-everything-first-time). **USDA** needs **`USDA_FAS_API_KEY`**. **FAOSTAT fertilizer** needs FAO API token or user/pass for the fertilizer leg of `--dataset all`.
+5. **Verify:** `SELECT * FROM pipeline_runs ORDER BY completed_at DESC LIMIT 20;` and row counts per table.
+6. **Streamlit:** `uv run streamlit run app/streamlit_app.py` — prefer **`get_read_client()`** + anon key for anything exposed beyond localhost.
+7. **Optional:** Seed `country_lookup`; production RLS; CI / smoke tests.
 
 ---
 
@@ -130,7 +167,10 @@ uv run python pullers/pull_worldbank_wdi.py
 uv run python pullers/pull_faostat.py --dataset all   # or: crops | fertilizer | fbs
 uv run python pullers/pull_eia.py
 uv run python pullers/pull_usda_psd.py
+uv run python pullers/pull_comtrade_hs_lookup.py
 uv run python loaders/load_baci.py --all
+uv run python loaders/load_cepi_beyond_baci.py protee   # optional
+uv run python loaders/load_cepi_beyond_baci.py geodep   # optional; long
 
 uv run streamlit run app/streamlit_app.py
 ```
@@ -143,8 +183,11 @@ uv run streamlit run app/streamlit_app.py
 |------|------|
 | [utils/supabase_client.py](utils/supabase_client.py) | `get_client()`, `get_read_client()` |
 | [utils/pipeline_logger.py](utils/pipeline_logger.py) | `start_run` / `finish_run` → `pipeline_runs` |
-| [schema/create_tables.sql](schema/create_tables.sql) | Full DDL + upsert `UNIQUE` targets |
+| [schema/create_tables.sql](schema/create_tables.sql) | Full DDL + upsert `UNIQUE` targets + `table_catalog` seed |
+| [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql) | Idempotent `table_catalog` row updates only |
+| [loaders/load_cepi_beyond_baci.py](loaders/load_cepi_beyond_baci.py) | CEPII ProTEE / GeoDep loaders + dataset semantics |
+| [README.md](README.md) | User-facing spec, puller docs, schema, HS scope, future roadmap |
 
 ---
 
-*Last updated for handoff context; keep this file in sync when behavior or env vars change materially.*
+*Handover note: keep this file aligned with README when you add pullers, tables, or env vars.*

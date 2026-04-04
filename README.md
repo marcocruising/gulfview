@@ -25,8 +25,10 @@ hormuz-supply-chain/
 ├── .gitignore
 │
 ├── data/
-│   └── baci/                        # manually downloaded BACI CSV files go here
-│       └── .gitkeep                 # keeps the folder in git, ignores contents
+│   ├── baci/                        # manually downloaded BACI CSV files go here
+│   │   └── .gitkeep
+│   └── cepi/                        # other CEPII CSVs (ProTEE, GeoDep) and optional WTFC/CHELEM zips
+│       └── .gitkeep
 │
 ├── schema/
 │   └── create_tables.sql            # full Supabase schema — run once
@@ -36,10 +38,12 @@ hormuz-supply-chain/
 │   ├── pull_faostat.py              # FAOSTAT: crops (bulk ZIP) + fertilizers (API) + FBS (bulk ZIP)
 │   ├── pull_worldbank.py            # World Bank Pink Sheet: commodity prices
 │   ├── pull_worldbank_wdi.py        # World Bank WDI API: population, GDP, GDP per capita
-│   └── pull_usda_psd.py             # USDA PSD: crop supply/demand by country
+│   ├── pull_usda_psd.py             # USDA PSD: crop supply/demand by country
+│   └── pull_comtrade_hs_lookup.py   # UN Comtrade: HS6 descriptions → hs_code_lookup
 │
 ├── loaders/                         # scripts that ingest manually downloaded files
-│   └── load_baci.py                 # BACI: bilateral trade flows (HS6, 200 countries)
+│   ├── load_baci.py                 # BACI: bilateral trade flows (HS6, 200 countries)
+│   └── load_cepi_beyond_baci.py     # CEPII ProTEE + GeoDep (elasticities & import-dependence)
 │
 ├── app/
 │   └── streamlit_app.py             # data explorer UI — reads from Supabase only
@@ -87,29 +91,53 @@ SUPABASE_ANON_PUBLIC_KEY=...
 
 **Read-only UI** (e.g. Streamlit against RLS-protected data) can use `get_read_client()` with **`SUPABASE_ANON_PUBLIC_KEY`** or **`SUPABASE_PUBLISHABLE_KEY`**.
 
-**FAOSTAT fertilizer pull** needs **`FAOSTAT_API_TOKEN`** (or username/password) in `.env`; optional tuning vars are listed in [`.env.example`](.env.example). Keep secrets out of `.env.example`.
+**USDA PSD pull** needs **`USDA_FAS_API_KEY`** in `.env` ([api.fas.usda.gov](https://api.fas.usda.gov)). **FAOSTAT fertilizer** needs **`FAOSTAT_API_TOKEN`** (or username/password); optional tuning vars are in [`.env.example`](.env.example). Keep secrets out of `.env.example`.
 
 ### 3. Initialise the database
 
-Run the schema file once against your Supabase project:
+Apply [schema/create_tables.sql](schema/create_tables.sql) once to your Supabase project (creates all tables, indexes, and **seeds `table_catalog`**):
 
 ```bash
-# Option A: paste schema/create_tables.sql into Supabase SQL Editor and run
-# Option B: use psql with your connection string
+# Option A: Supabase Dashboard → SQL Editor → paste the file and run
+# Option B: psql with your Postgres connection string
 psql "$DATABASE_URL" -f schema/create_tables.sql
 ```
+
+To refresh dictionary text only (without re-running the whole schema file), use [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql).
+
+If you use **Cursor with the Supabase MCP** connected to this project, you can apply the same DDL via **`apply_migration`** (or run the SQL from the file there) instead of pasting manually.
 
 ---
 
 ## Database Schema
 
-All tables follow these conventions:
+**Time-series and fact tables** (`energy_trade_flows`, `bilateral_trade`, `crop_production`, etc.) follow these conventions:
 - `source` — name of the script that wrote the row (e.g. `pull_eia`)
 - `pulled_at` — UTC timestamp when the row was inserted/upserted
-- `data_year` — the reference year the data describes (not the pull year)
-- Primary keys are composite natural keys so upserts are safe to re-run
+- `data_year` — the reference year the data describes (not the pull year), when applicable
+
+**Reference tables** `hs_code_lookup` and `country_lookup` have no `source` / `pulled_at` / `data_year`; they are keyed for joins and manual or puller-driven updates.
+
+Natural keys and `UNIQUE` constraints match puller/loader `on_conflict` targets so upserts are safe to re-run.
 
 ### Tables
+
+#### `table_catalog`
+Reference **data dictionary**: one row per application table describing **title**, **summary** (what the table contains and what it is for), **row_grain** (what one row represents), **key_columns** (join / upsert keys), **populated_by** (which script maintains it), and **sort_order** for display. Not populated by a puller; rows ship with the schema (see [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql) and the tail of [schema/create_tables.sql](schema/create_tables.sql)). Re-run the seed `INSERT ... ON CONFLICT DO UPDATE` after you add a new table or change meanings.
+
+```sql
+id              SERIAL PRIMARY KEY
+table_schema    TEXT NOT NULL DEFAULT 'public'
+table_name      TEXT NOT NULL
+title           TEXT NOT NULL
+summary         TEXT NOT NULL
+row_grain       TEXT
+key_columns     TEXT
+populated_by    TEXT
+sort_order      INTEGER NOT NULL DEFAULT 0
+updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+UNIQUE (table_schema, table_name)
+```
 
 #### `pipeline_runs`
 Log of every script execution. Check this to know what data you have and when it was last refreshed.
@@ -238,12 +266,12 @@ UNIQUE (country, commodity, metric, data_year)
 ```
 
 #### `hs_code_lookup`
-Reference table for HS codes used in this project.
+Reference table for HS 6-digit codes. **English descriptions** are loaded from the UN Comtrade public reference file ([`pull_comtrade_hs_lookup.py`](pullers/pull_comtrade_hs_lookup.py)). `category` is filled for codes that fall under the project’s V1 HS prefixes (same logic as the BACI loader); other codes have `category` null.
 
 ```sql
 hs6_code        TEXT PRIMARY KEY
 description     TEXT
-category        TEXT              -- 'energy' | 'fertilizer_input' | 'fertilizer' | 'crop'
+category        TEXT              -- 'energy' | 'fertilizer_input' | 'fertilizer' | 'crop' (V1 scope only)
 notes           TEXT
 ```
 
@@ -256,6 +284,41 @@ iso2            TEXT
 country_name    TEXT
 region          TEXT
 is_gulf_producer BOOLEAN         -- TRUE for: SAU, ARE, IRQ, KWT, QAT, IRN
+```
+
+#### `cepii_protee_hs6`
+**Product-level trade elasticities (ProTEE 0.1)** — econometric parameters per HS6, *not* trade flows. See the **Loaders** section, subsection *`load_cepi_beyond_baci.py`*, for how this differs from `bilateral_trade`.
+
+```sql
+hs6_code                        TEXT PRIMARY KEY
+flag_nonsignificant_at_1pct     BOOLEAN   -- CEPII "Zero": HS6 tariff coefficient not significant at 1%
+flag_positive_significant       BOOLEAN   -- CEPII "Positive": positive significant elasticity in estimation
+trade_elasticity                NUMERIC   -- published value (CSV "sigma"; may be HS4 substitute per CEPII)
+hs_revision                     TEXT      -- 'HS2007' (CEPII documentation; not HS22 like current BACI)
+source                          TEXT
+pulled_at                       TIMESTAMPTZ
+```
+
+#### `cepii_geodep_import_dependence`
+**GeoDep** — CEPII’s importer × HS6 × year **import-dependence diagnostics** (concentration, persistence, strategic sectors, top supplier), built from BACI. One summary row per `(country, hs6_code, data_year)` for 2019–2022 in the public file — *not* bilateral flows (those stay in `bilateral_trade`).
+
+```sql
+id                              SERIAL PRIMARY KEY
+country                         TEXT      -- ISO3 (CSV iso_d)
+hs6_code                        TEXT
+data_year                       INTEGER
+import_value                    NUMERIC   -- from CEPII import_dpt (import exposure in their construction)
+hhi_import_concentration        NUMERIC   -- criterion 1: supplier HHI; >0.4 ⇒ concentrated imports
+hhi_world_export_concentration  NUMERIC   -- criterion 2: world-export HHI; >0.4 ⇒ concentrated
+import_to_export_ratio          NUMERIC   -- criterion 3: imports/exports; >1 ⇒ hard to substitute domestically; 9999 ⇒ null exports in source
+flag_persistent_criteria        BOOLEAN   -- criterion 4: conditions hold ≥2 years in a 3-year window (CSV c4)
+flag_import_dependent           BOOLEAN
+sector_strategic_*              BOOLEAN   -- agrifood, chemicals, pharmaceuticals, steel, defense, transport, electronics, other
+leading_exporter_code           TEXT      -- CEPII partner code (e.g. EUN, USA); not always ISO3
+leading_exporter_share_pct      NUMERIC
+source                          TEXT
+pulled_at                       TIMESTAMPTZ
+UNIQUE (country, hs6_code, data_year)
 ```
 
 ---
@@ -397,9 +460,9 @@ uv run python pullers/pull_worldbank_wdi.py
 
 ### `pull_usda_psd.py` — USDA Production, Supply and Distribution
 
-**Source:** USDA Foreign Agricultural Service
-**URL:** https://apps.fas.usda.gov/psdonline/
-**API key:** None required
+**Source:** USDA Foreign Agricultural Service  
+**URL:** https://api.fas.usda.gov/api/psd (Open Data API) — human UI: https://apps.fas.usda.gov/psdonline/  
+**API key:** **Required** — register at https://api.fas.usda.gov and set **`USDA_FAS_API_KEY`** in `.env` (see [`.env.example`](.env.example)).  
 **Writes to:** `crop_production`
 **Data available:** Production, consumption, imports, exports, ending stocks by crop and country
 **Refresh cadence:** Monthly (USDA updates on a fixed schedule)
@@ -407,6 +470,20 @@ uv run python pullers/pull_worldbank_wdi.py
 
 ```bash
 uv run python pullers/pull_usda_psd.py
+```
+
+### `pull_comtrade_hs_lookup.py` — UN Comtrade HS classification (HS6 text)
+
+**Source:** UN Comtrade Data API reference cache  
+**URL:** https://comtrade.un.org/data/cache/classificationHS.json  
+**API key:** None (public JSON)
+
+**Writes to:** `hs_code_lookup`  
+**Data available:** All **6-digit HS** entries in the Comtrade “HS (as reported)” tree (~6,900 codes) with **English** `text` labels. Descriptions are suitable for joining to `bilateral_trade.hs6_code`; they follow the Comtrade reference nomenclature (close to recent WCO HS editions; your BACI files may use a specific HS revision such as HS 2022 — verify critical codes if legal precision matters).  
+**Refresh cadence:** Occasional (re-run after Comtrade updates the reference file)
+
+```bash
+uv run python pullers/pull_comtrade_hs_lookup.py
 ```
 
 ---
@@ -449,6 +526,54 @@ not try to load all 5,000 products. This keeps DB size manageable and load time 
 **Known limitation:** Annual only, no monthly granularity. Use Comtrade API (future v2)
 for more recent or more specific bilateral queries.
 
+### `load_cepi_beyond_baci.py` — CEPII ProTEE, GeoDep, zip archives
+
+**Source:** CEPII — [Product Level Trade Elasticities (ProTEE)](https://www.cepii.fr/cepii/en/bdd_modele/bdd_modele_item.asp?id=35), [GeoDep](https://www.cepii.fr/cepii/en/bdd_modele/bdd_modele_item.asp?id=41), [WTFC](https://www.cepii.fr/cepii/en/bdd_modele/bdd_modele_item.asp?id=29), [CHELEM](https://www.cepii.fr/cepii/en/bdd_modele/bdd_modele_item.asp?id=17)  
+**Registration:** Public CSV downloads for ProTEE and GeoDep; WTFC/CHELEM zips as published  
+**Writes to:** `cepii_protee_hs6`, `cepii_geodep_import_dependence` (CSV legs only)
+
+The loader’s module docstring is the full technical reference. Below is what each piece **means** and how it **differs from data you already have** in Supabase.
+
+#### Versus BACI (`bilateral_trade`)
+
+| Aspect | BACI in this project | ProTEE | GeoDep |
+|--------|----------------------|--------|--------|
+| **Question it answers** | “How much did **A export to B** in product **k** (USD, tonnes)?” | “How **price-sensitive** are imports of product **k** (elasticity)?” | “Is country **c**’s demand for product **k** **geographically concentrated / dependent**, and **who leads**?” |
+| **Grain** | Exporter × importer × HS6 × year | HS6 **only** (global product parameter) | Importer × HS6 × year **summary** |
+| **Nature** | **Factual flows** | **Estimated parameter** (econometrics) | **Derived indicators** from BACI |
+| **HS vintage** | Your files: **HS 2022** | CEPII: **HS 2007** | Aligned with GeoDep/BACI vintage in CEPII release |
+| **Joining** | Join to `hs_code_lookup`, EIA, etc. | Join to HS6 **only with a concordance** HS2007↔HS2022 if you need strict alignment | Can join to `bilateral_trade` on `(importer, hs6, year)` **approximately** (same HS6 digits; revision mismatch still applies) |
+
+#### ProTEE (loaded from `data/cepi/ProTEE_0_1.csv`)
+
+- **Represents:** CEPII’s published **import-demand elasticity** per HS6 from tariff variation (gravity). Values are in column `sigma` in the file; CEPII’s site calls this the elasticity.
+- **Flags:** `zero` → stored as `flag_nonsignificant_at_1pct` (original HS6 estimate not significant at 1%). `positive` → `flag_positive_significant`. When those apply, CEPII **replaces** the HS6 point estimate with the **HS4 sector average** in the published column — interpret `trade_elasticity` together with the flags.
+- **Not a substitute for:** `bilateral_trade`, `commodity_prices`, or tariffs in your DB — it is **meta** for simulation and sensitivity analysis.
+
+#### GeoDep (loaded from `data/cepi/geodep_data.csv`)
+
+- **Represents:** Official CEPII **import dependency** screening for **2019–2022** (see their methodology: four criteria — import HHI, world-export HHI, import/export ratio with **9999** when exports are missing, and persistence over a three-year window). Strategic sector dummies and **leading exporter** + **share** describe *where* dependence sits.
+- **`import_value`:** Maps CSV `import_dpt` (large, skewed magnitudes — **import exposure** in CEPII’s construction, not an HHI).
+- **`leading_exporter_code`:** CEPII/CHELEM-style codes (**not** always ISO3); treat as an opaque partner key unless you map CEPII’s nomenclature.
+- **Not a substitute for:** BACI rows — GeoDep **aggregates** information into one diagnostic row per country–product–year; it does not list every partner.
+
+#### WTFC and CHELEM zips in `data/cepi/` (not loaded by this script)
+
+- **WTFC ([World Trade Flows Characterization](https://www.cepii.fr/cepii/en/bdd_modele/bdd_modele_item.asp?id=29)):** Reconciled **unit values** at exporter–importer–HS6–year plus **trade type** (e.g. one-way vs intra-industry) and **price range** vs other flows of the same product. **HS96** in your bundle — older than BACI HS22.
+- **`price_range_CHELEM_*.zip` / `type_CHELEM_*.zip`:** Same **WTFC** ideas on **CHELEM** product categories (71 goods, etc.), not HS6 BACI lines.
+- **Difference vs BACI:** BACI targets **consistent values and quantities** for macro bilateral trade; WTFC targets **comparable unit values and flow typology**. Complementary, not redundant.
+- **Why no loader yet:** Yearly WTFC CSVs are **very large** (hundreds of MB each). Add a dedicated streaming loader with HS/year filters if you need this in Postgres.
+
+```bash
+uv run python loaders/load_cepi_beyond_baci.py protee   # ~5k HS6 rows
+uv run python loaders/load_cepi_beyond_baci.py geodep # ~3M rows; long run; safe to re-run on failure
+uv run python loaders/load_cepi_beyond_baci.py all
+```
+
+Optional: set `GEODEP_HS_PREFIXES` in the script (same idea as `HS_CODES` in `load_baci.py`) to load only products under selected HS prefixes and shrink runtime.
+
+**Known limitation:** Large GeoDep uploads may hit transient HTTP/TLS errors; re-run — upserts are idempotent.
+
 ---
 
 ## Running Everything (First Time)
@@ -459,21 +584,25 @@ uv sync
 cp .env.example .env
 # edit .env with your Supabase credentials
 
-# 2. Initialise schema
-# paste schema/create_tables.sql into Supabase SQL Editor and run
+# 2. Initialise schema (SQL Editor, psql, or Supabase MCP migration — see §3 above)
 
-# 3. Load BACI first (largest, most important bilateral dataset)
-# download files manually to data/baci/ first — see loader section above
+# 3. Reference HS text (optional before BACI; improves labels in the app)
+uv run python pullers/pull_comtrade_hs_lookup.py
+
+# 4. Load BACI (largest bilateral dataset) — download CSVs to data/baci/ first
 uv run python loaders/load_baci.py --all
 
-# 4. Run all pullers
+# 4b. Optional — CEPII ProTEE + GeoDep CSVs in data/cepi/ (see Loaders section)
+# uv run python loaders/load_cepi_beyond_baci.py all
+
+# 5. Run remaining pullers (FAOSTAT --dataset all needs FAO API creds for the fertilizer leg; use --dataset crops|fbs to skip)
 uv run python pullers/pull_eia.py
 uv run python pullers/pull_faostat.py --dataset all
 uv run python pullers/pull_worldbank.py
 uv run python pullers/pull_worldbank_wdi.py
 uv run python pullers/pull_usda_psd.py
 
-# 5. Launch the explorer
+# 6. Launch the explorer
 uv run streamlit run app/streamlit_app.py
 ```
 
@@ -484,11 +613,13 @@ uv run streamlit run app/streamlit_app.py
 | Script | When to re-run |
 |---|---|
 | `load_baci.py` | Annually, when CEPII releases new year |
+| `load_cepi_beyond_baci.py` | When CEPII refreshes ProTEE / GeoDep CSVs |
 | `pull_eia.py` | Monthly |
 | `pull_faostat.py` | Annually; `--dataset` crops / fertilizer / fbs / all (FBS bulk is large) |
 | `pull_worldbank.py` | Monthly |
 | `pull_worldbank_wdi.py` | Annual (or when extending years) |
 | `pull_usda_psd.py` | Monthly |
+| `pull_comtrade_hs_lookup.py` | When Comtrade updates HS reference, or once after schema init |
 
 Check what is in your database and when it was last pulled:
 
@@ -502,26 +633,17 @@ ORDER BY completed_at DESC;
 
 ## Streamlit Data Explorer (V1)
 
-The V1 app is intentionally a simple data explorer — no computed metrics,
-no derived scores, no charts. The goal is to verify the data is complete and
-queryable before building analytical dashboards on top.
+The V1 app is a **tabbed** dashboard (not a generic “pick any table” grid). There is no derived Hormuz exposure score yet — the goal is to sanity-check data and joins.
 
-**Sidebar filters:**
-- Table selector (choose which table to explore)
-- Year range slider
-- Country multi-select (ISO3)
-- HS code multi-select (for `bilateral_trade` table)
-- Product or crop multi-select
+| Tab | What it shows |
+|-----|----------------|
+| **Prices over time** | `commodity_prices` (World Bank Pink Sheet monthly series) |
+| **Who trades what** | Top exporters/importers from `bilateral_trade` by HS6 and year |
+| **Country profile** | Per-country import/export totals by HS6 for one year (joins `hs_code_lookup` for descriptions when present) |
+| **Crop production** | `crop_production` rankings by crop, metric, year |
+| **Pipeline status** | Recent `pipeline_runs` and latest run per script |
 
-**Main panel:**
-- Row count and data freshness banner (shows `pulled_at` from most recent pipeline run for selected table)
-- Paginated data table with all columns visible
-- Basic summary stats (min, max, sum, count for numeric columns)
-- CSV download button for current filtered view
-
-**Pipeline status tab:**
-- Table of recent `pipeline_runs` entries
-- Last successful run per script, row counts, any errors
+**Not in the UI yet:** dedicated views for `country_macro_indicators`, `food_balance_sheets`, `energy_trade_flows`, or `fertilizer_production` — query those in SQL or extend the app when needed.
 
 ```bash
 uv run streamlit run app/streamlit_app.py

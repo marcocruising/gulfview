@@ -17,3 +17,9 @@ data/baci/*
 # CEPI CSVs are large — same pattern
 data/cepi/*
 !data/cepi/.gitkeep
+
+# JODI / USGS manual downloads — keep dirs, ignore blobs
+data/jodi/*
+!data/jodi/.gitkeep
+data/usgs/*
+!data/usgs/.gitkeep

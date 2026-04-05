@@ -7,6 +7,8 @@ __pycache__/
 .Python
 *.so
 .DS_Store
+# LibreOffice Calc lock files (do not commit)
+**/.~lock.*
 .uv/
 uv.lock.bak
 

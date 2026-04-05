@@ -29,7 +29,7 @@ hormuz-supply-chain/
 │   ├── cepi/                        # ProTEE + GeoDep CSVs; optional WTFC/CHELEM zips (no loader)
 │   ├── jodi/                        # JODI CSV exports (gas/oil); load_jodi.py → jodi_energy_observations
 │   ├── usgs/                        # MCS CSV + myb3-*.xlsx yearbooks → load_usgs.py mcs | facilities
-│   └── globalenergymonitor/         # GEM .xlsx trackers; GIS .zip bundles deferred (maps later)
+│   └── globalenergymonitor/         # GEM .xlsx → load_gem_xlsx.py → gem_tracker_rows; GIS .zip deferred
 │
 ├── schema/
 │   └── create_tables.sql            # full Supabase schema — run once
@@ -46,7 +46,8 @@ hormuz-supply-chain/
 │   ├── load_baci.py                 # BACI: bilateral trade flows (HS6, 200 countries)
 │   ├── load_cepi_beyond_baci.py     # CEPII ProTEE + GeoDep (elasticities & import-dependence)
 │   ├── load_jodi.py                 # JODI oil/gas CSVs → jodi_energy_observations
-│   └── load_usgs.py                 # USGS: MCS CSV → usgs_mineral_statistics; myb3 xlsx → usgs_myb3_* tables
+│   ├── load_usgs.py                 # USGS: MCS CSV → usgs_mineral_statistics; myb3 xlsx → usgs_myb3_* tables
+│   └── load_gem_xlsx.py             # GEM: selected .xlsx → gem_tracker_rows (JSON per row)
 │
 ├── app/
 │   └── streamlit_app.py             # data explorer UI — reads from Supabase only
@@ -64,7 +65,7 @@ hormuz-supply-chain/
 | `data/cepi/` | `ProTEE_0_1.csv`, `geodep_data.csv`; optional **WTFC_HS96** / **CHELEM** zips (large) | **`cepii_protee_hs6`**, **`cepii_geodep_import_dependence`** via [`loaders/load_cepi_beyond_baci.py`](loaders/load_cepi_beyond_baci.py). **WTFC/CHELEM zips:** no loader — deferred. |
 | `data/jodi/` | Flat **CSVs** (e.g. gas `STAGING_world_NewFormat.csv`, oil `primaryyear2026.csv` — same column layout); optional `jodi-oil-country-note.xlsx` (notes) | **`jodi_energy_observations`** via [`loaders/load_jodi.py`](loaders/load_jodi.py). Gas files often span **2009–present** (~18k rows/year at steady state); the loader defaults to **`data_year >= 2020`** to match BACI-style horizons — use **`--all-years`** or **`--min-year YYYY`** to change. |
 | `data/usgs/` | **`MCS*_Commodities_Data.csv`**; regional **`myb3-{year}-{country}.xlsx`** (Minerals Yearbook Vol. III–style) | **`usgs_mineral_statistics`** via `load_usgs.py mcs` (**`cp1252`**, **`record_fingerprint`**). **`usgs_myb3_production`** + **`usgs_country_mineral_facilities`** via **`load_usgs.py facilities`** (Table 1 melt + Table 2 merged blocks, **`Do.`** ditto). Regional files: Bahrain, Iraq, Oman, Qatar, UAE (2019); Iran, Saudi Arabia (2023). Cursor may omit `.xlsx` from search — use **`Path.glob("myb3*.xlsx")`** or the OS folder. Details: [HANDOVER.md](HANDOVER.md) **USGS myb3 yearbooks**. |
-| `data/globalenergymonitor/` | **`.xlsx`** trackers (LNG, GOGPT, pipelines summaries, etc.) | **Not loaded yet.** Planned: tabular GEM loader(s). **`.zip` GIS** (`.geojson`/`.gpkg`): **out of scope for first pass** — keep files for a later PostGIS / map phase. |
+| `data/globalenergymonitor/` | **`.xlsx`** trackers | **`gem_tracker_rows`** via [`loaders/load_gem_xlsx.py`](loaders/load_gem_xlsx.py) (default: those four trackers plus GGIT gas pipelines, GGIT LNG terminals, GOIT oil/NGL pipelines, Global Integrated Power). **`.zip` GIS**: deferred. |
 
 **`table_catalog`** ([`schema/seed_table_catalog.sql`](schema/seed_table_catalog.sql)) describes existing tables; add rows when new tables land (e.g. GEM).
 
@@ -699,6 +700,18 @@ uv run python loaders/load_usgs.py facilities   # myb3-*.xlsx → usgs_myb3_prod
 
 **myb3 xlsx (`facilities`):** Ingests all matching workbooks under `data/usgs/`. Semantics and edge cases: [HANDOVER.md](HANDOVER.md) **USGS myb3 yearbooks**. Schema: [`schema/create_tables.sql`](schema/create_tables.sql); catalog: [`schema/seed_table_catalog.sql`](schema/seed_table_catalog.sql). After changing the parser, run **`uv run python scripts/validate_myb3_table2.py`** (ditto expansion in O/L/C, commodity `Do.` replay, **`commodity_cell_raw`** matches **`commodity_leaf_resolved`** on ditto rows, idempotent re-parse).
 
+### `load_gem_xlsx.py` — Global Energy Monitor (default bundle)
+
+**Writes to:** `gem_tracker_rows` — one row per Excel data line; headers become keys on **`payload`** (JSONB).
+
+**Default** (no args) loads data sheets from eight workbooks: the four industrial/plant trackers above (six sheets total) plus **GEM-GOIT-Oil-NGL-Pipelines** (`Pipelines`), **GEM-GGIT-LNG-Terminals** (`LNG Terminals`), **GEM-GGIT-Gas-Pipelines** (`Pipelines`), **Global Integrated Power** (`Power facilities`, `Regions, area, and countries`).
+
+```bash
+uv run python loaders/load_gem_xlsx.py --dry-run   # parse only; print row counts
+uv run python loaders/load_gem_xlsx.py             # needs Supabase + `gem_tracker_rows` in schema
+uv run python loaders/load_gem_xlsx.py --file Other.xlsx   # all sheets except About/Metadata
+```
+
 ---
 
 ## Running Everything (First Time)
@@ -745,6 +758,7 @@ uv run streamlit run app/streamlit_app.py
 | `load_cepi_beyond_baci.py` | When CEPII refreshes ProTEE / GeoDep CSVs |
 | `load_jodi.py` | When you refresh JODI CSV exports under `data/jodi/` |
 | `load_usgs.py` | New MCS CSV (`mcs`); when `myb3-*.xlsx` change, re-run `facilities` |
+| `load_gem_xlsx.py` | When default GEM `.xlsx` files change under `data/globalenergymonitor/` |
 | `pull_eia.py` | Monthly |
 | `pull_faostat.py` | Annually; `--dataset` crops / fertilizer / fbs / all (FBS bulk is large) |
 | `pull_worldbank.py` | Monthly |
@@ -797,7 +811,7 @@ The app should read Supabase settings from `.env` via python-dotenv — use `get
 | Exposure scores not computed | Raw data only, no derived Hormuz dependency index | Build iteratively once data is validated |
 | Pink Sheet XLSX URL can 404 after WB republish | Pull fails until `PINK_SHEET_MONTHLY_XLSX_URL` is updated; check `pipeline_runs.error_message` | Manual URL refresh from World Bank doc page (script logs instructions) |
 | USGS myb3 not loaded | Empty `usgs_myb3_*` tables | Place `myb3-*.xlsx` under `data/usgs/` and run `uv run python loaders/load_usgs.py facilities` |
-| GEM on disk not in Postgres | Cannot query GEM trackers in SQL | Add DDL + tabular loader(s) per [HANDOVER.md](HANDOVER.md) |
+| GEM default bundle not loaded | Empty `gem_tracker_rows` | Apply `gem_tracker_rows` DDL from [`schema/create_tables.sql`](schema/create_tables.sql), then `uv run python loaders/load_gem_xlsx.py` |
 | JODI gas CSV is long history | Large row count if you use `--all-years` | Default `load_jodi.py` keeps `data_year >= 2020` (~39% of current gas export); override with `--min-year` / `--all-years` |
 
 ---

@@ -11,7 +11,7 @@ This note is for the next agent or developer picking up the repo. The canonical 
 - **Rule:** Pullers/loaders write to Supabase; the Streamlit app should read only (see README).
 - **`table_catalog`:** Reference rows describing every application table (purpose, grain, keys, scripts). Seeded from SQL; update [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql) when you add tables.
 
-**Planned loaders (not in repo yet — resume here):** **GEM** (`data/globalenergymonitor/*.xlsx` only — skip `*.zip` GIS for v1). **Done:** **JODI** [`load_jodi.py`](loaders/load_jodi.py); **USGS** [`load_usgs.py`](loaders/load_usgs.py) — `mcs` → `usgs_mineral_statistics`; **`facilities`** → `usgs_myb3_production` + `usgs_country_mineral_facilities` from `myb3-*.xlsx`. Extend schema/catalog when GEM lands.
+**GEM (partial):** [`load_gem_xlsx.py`](loaders/load_gem_xlsx.py) → **`gem_tracker_rows`** (JSON payload per Excel row). Default bundle: cement/concrete, iron ore mines, chemicals plants, iron/steel plant-level sheets, plus GGIT gas pipelines, GGIT LNG terminals, GOIT oil/NGL pipelines, Global Integrated Power (`Power facilities`, regions reference sheet); other `.xlsx` via `--file`. Skip `*.zip` GIS for v1. **Done:** **JODI** [`load_jodi.py`](loaders/load_jodi.py); **USGS** [`load_usgs.py`](loaders/load_usgs.py).
 
 **Pullers (all log `pipeline_runs`):**
 
@@ -32,6 +32,7 @@ This note is for the next agent or developer picking up the repo. The canonical 
 | [load_cepi_beyond_baci.py](loaders/load_cepi_beyond_baci.py) | `cepii_protee_hs6`, `cepii_geodep_import_dependence` |
 | [load_jodi.py](loaders/load_jodi.py) | `jodi_energy_observations` |
 | [load_usgs.py](loaders/load_usgs.py) | `usgs_mineral_statistics` (`mcs`); `usgs_myb3_production` + `usgs_country_mineral_facilities` (`facilities` / `myb3*.xlsx`) |
+| [load_gem_xlsx.py](loaders/load_gem_xlsx.py) | `gem_tracker_rows` (default GEM `.xlsx` bundle under `data/globalenergymonitor/`) |
 
 **CEPII beyond BACI (what it is vs `bilateral_trade`):** BACI = reconciled **bilateral flows** (exporter, importer, HS6, value, qty). **ProTEE** = one row per HS6 **import-demand elasticity** + flags (not flows; HS **2007** in CEPII’s file). **GeoDep** = importer × HS6 × year **dependence diagnostics** (HHI, persistence, top supplier code) derived from BACI — not a replacement for flow-level rows. **WTFC/CHELEM zips** in `data/cepi/` are documented in [README.md](README.md) but have **no loader** yet (huge HS96 CSVs). Full semantics: module docstring in `load_cepi_beyond_baci.py` and README **Loaders** subsection.
 
@@ -154,7 +155,7 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 - **`country_macro_indicators`** / **`food_balance_sheets`** — filled by `pull_worldbank_wdi.py` and `pull_faostat.py --dataset fbs` (or `all`) after schema exists.
 - **`hs_code_lookup`** — run [pull_comtrade_hs_lookup.py](pullers/pull_comtrade_hs_lookup.py) once (or after Comtrade updates the JSON).
 - **Streamlit** — tabbed explorer (prices, BACI trade, crops, pipeline); no tabs yet for macro/FBS/energy/fertilizer, **CEPII ProTEE/GeoDep**, **`table_catalog`**, or future JODI/USGS/GEM.
-- **GEM** — no loaders/tables. **USGS MCS CSV** — `load_usgs.py mcs` + `usgs_mineral_statistics`. **USGS myb3** — `load_usgs.py facilities` + `usgs_myb3_production` / `usgs_country_mineral_facilities` (see **USGS myb3 yearbooks**). **JODI** — `load_jodi.py` + `jodi_energy_observations`.
+- **GEM** — default bundle: [`load_gem_xlsx.py`](loaders/load_gem_xlsx.py) → `gem_tracker_rows`; more trackers optional. **USGS MCS CSV** — `load_usgs.py mcs` + `usgs_mineral_statistics`. **USGS myb3** — `load_usgs.py facilities` + `usgs_myb3_production` / `usgs_country_mineral_facilities` (see **USGS myb3 yearbooks**). **JODI** — `load_jodi.py` + `jodi_energy_observations`.
 - **WTFC / CHELEM zips** under `data/cepi/` — no loader (entire WTFC family deferred, including CHELEM price_range/type zips).
 - **GEM GIS `*.zip`** (geojson/gpkg) — intentionally **deferred**; tabular `.xlsx` first.
 - **Pagination / offset** for EIA/USDA when responses exceed **5000** rows (OK for current year ranges; fragile if ranges widen).
@@ -182,7 +183,7 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 5. **Verify:** `SELECT * FROM pipeline_runs ORDER BY completed_at DESC LIMIT 20;` and row counts per table.
 6. **Streamlit:** `uv run streamlit run app/streamlit_app.py` — prefer **`get_read_client()`** + anon key for anything exposed beyond localhost.
 7. **Optional:** Seed `country_lookup`; production RLS; CI / smoke tests.
-8. **Next data wave:** **GEM** loader/tables. **JODI:** `uv run python loaders/load_jodi.py`. **USGS:** `uv run python loaders/load_usgs.py mcs` (MCS CSV); **`uv run python loaders/load_usgs.py facilities`** (myb3 `*.xlsx`).
+8. **Next data wave:** extend **GEM** (`load_gem_xlsx.py` / more `.xlsx`). **JODI:** `uv run python loaders/load_jodi.py`. **USGS:** `uv run python loaders/load_usgs.py mcs` (MCS CSV); **`uv run python loaders/load_usgs.py facilities`** (myb3 `*.xlsx`).
 
 ---
 
@@ -205,6 +206,7 @@ uv run python loaders/load_cepi_beyond_baci.py geodep   # optional; long
 uv run python loaders/load_jodi.py   # optional; default min year 2020
 uv run python loaders/load_usgs.py mcs          # optional; MCS CSV under data/usgs/
 uv run python loaders/load_usgs.py facilities   # optional; myb3-*.xlsx under data/usgs/
+uv run python loaders/load_gem_xlsx.py      # optional; default GEM bundle → gem_tracker_rows
 
 uv run streamlit run app/streamlit_app.py
 ```

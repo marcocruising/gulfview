@@ -182,6 +182,16 @@ INSERT INTO table_catalog (
     'record_fingerprint',
     'loaders/load_usgs.py facilities',
     140
+),
+(
+    'public',
+    'gem_tracker_rows',
+    'Global Energy Monitor (GEM) tracker rows',
+    'Rows from selected GEM Excel trackers as JSON payloads keyed by column header. Default load: cement/concrete, iron ore mines, chemicals inventory, iron/steel plant-level data sheets.',
+    'One row per workbook file, sheet, and Excel data row.',
+    'source_file, sheet_name, excel_row_1based',
+    'loaders/load_gem_xlsx.py',
+    145
 )
 ON CONFLICT (table_schema, table_name) DO UPDATE SET
     title = EXCLUDED.title,

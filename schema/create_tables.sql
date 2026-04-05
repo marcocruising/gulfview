@@ -282,6 +282,26 @@ CREATE INDEX IF NOT EXISTS idx_usgs_facilities_country_ref
 ALTER TABLE usgs_myb3_production DISABLE ROW LEVEL SECURITY;
 ALTER TABLE usgs_country_mineral_facilities DISABLE ROW LEVEL SECURITY;
 
+-- Global Energy Monitor — tabular tracker rows as JSON (one row per Excel data row; header row excluded).
+CREATE TABLE IF NOT EXISTS gem_tracker_rows (
+    id                  SERIAL PRIMARY KEY,
+    source_file         TEXT NOT NULL,
+    sheet_name          TEXT NOT NULL,
+    excel_row_1based    INTEGER NOT NULL,
+    payload             JSONB NOT NULL,
+    source              TEXT NOT NULL,
+    pulled_at           TIMESTAMPTZ NOT NULL,
+    UNIQUE (source_file, sheet_name, excel_row_1based)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gem_tracker_source_sheet
+    ON gem_tracker_rows (source_file, sheet_name);
+
+CREATE INDEX IF NOT EXISTS idx_gem_tracker_payload_gin
+    ON gem_tracker_rows USING GIN (payload);
+
+ALTER TABLE gem_tracker_rows DISABLE ROW LEVEL SECURITY;
+
 CREATE INDEX IF NOT EXISTS idx_cepii_geodep_country_year
     ON cepii_geodep_import_dependence (country, data_year);
 
@@ -483,6 +503,16 @@ INSERT INTO table_catalog (
     'record_fingerprint',
     'loaders/load_usgs.py facilities',
     140
+),
+(
+    'public',
+    'gem_tracker_rows',
+    'Global Energy Monitor (GEM) tracker rows',
+    'Rows from selected GEM Excel data downloads: each row is one spreadsheet line with column names as JSON keys. Default bundle: cement/concrete, iron ore mines, chemicals inventory, iron/steel plant-level sheets. Provenance via source_file and sheet_name; excel_row_1based matches Excel (header row 1).',
+    'One row per workbook file, sheet, and Excel data row.',
+    'source_file, sheet_name, excel_row_1based',
+    'loaders/load_gem_xlsx.py',
+    145
 )
 ON CONFLICT (table_schema, table_name) DO UPDATE SET
     title = EXCLUDED.title,

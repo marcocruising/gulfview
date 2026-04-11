@@ -11,7 +11,11 @@ This note is for the next agent or developer picking up the repo. The canonical 
 - **Rule:** Pullers/loaders write to Supabase; the Streamlit app should read only (see README).
 - **`table_catalog`:** Reference rows describing every application table (purpose, grain, keys, scripts). Seeded from SQL; update [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql) when you add tables.
 
-**GEM (partial):** [`load_gem_xlsx.py`](loaders/load_gem_xlsx.py) → **`gem_tracker_rows`** (JSON payload per Excel row). Default bundle: cement/concrete, iron ore mines, chemicals plants, iron/steel plant-level sheets, plus GGIT gas pipelines, GGIT LNG terminals, GOIT oil/NGL pipelines, Global Integrated Power (`Power facilities`, regions reference sheet); other `.xlsx` via `--file`. Skip `*.zip` GIS for v1. **Done:** **JODI** [`load_jodi.py`](loaders/load_jodi.py); **USGS** [`load_usgs.py`](loaders/load_usgs.py).
+**Streamlit trade RPCs:** Apply [`schema/rpc_trade_dashboards.sql`](schema/rpc_trade_dashboards.sql) after `create_tables.sql`. The **Exporter & partners** section uses these for fast aggregates (HS6 totals, partner totals, supplier concentration) and is **lazy / stepwise** (Load buttons). The **Group dependencies** section uses additional RPCs (group share of world exports by HS6, importer exposure, distinct exporters per year) plus tables **`trade_group_dependency_snapshots`** / **`trade_group_dependency_rows`** for saved runs; heavy aggregates use **`plpgsql`** with **`statement_timeout = 120s`** to avoid PostgREST timeouts. Shared logic lives in [`utils/group_dependency_compute.py`](utils/group_dependency_compute.py); CLI mirror: [`scripts/run_group_dependency_snapshot.py`](scripts/run_group_dependency_snapshot.py). **`./scripts/verify.sh`** runs `py_compile` + `unittest`.
+
+**Streamlit navigation (important):** The app uses a **sidebar section radio**, not `st.tabs` for the eight main areas. Native tabs would execute **all** tab bodies on every rerun (any slider anywhere), which looked like “the whole app reloading.” Only the selected section runs. **Group dependencies** is additionally wrapped in **`@st.fragment()`** so in-section controls do not rerun the entire script. Heavy RPCs there are gated on **Load / compute** (or same-params cache / loaded snapshot), not on every widget change. PostgREST JSON keys for RPCs must match Postgres names (**`p_data_year`**, **`p_hs6_code`**, etc.).
+
+**GEM:** [`load_gem_xlsx.py`](loaders/load_gem_xlsx.py) → **`gem_tracker_rows`** (`payload` JSONB = row as header→value map; unique on `source_file`, `sheet_name`, `excel_row_1based`). Default bundle = eight workbooks (industrial/plant trackers + GGIT/GOIT pipelines/LNG + Global Integrated Power); canonical sheet list in script **`DEFAULT_WORKBOOKS`**. Other `.xlsx` via `--file` (skips **About** / **Metadata** unless `--include-meta-sheets`). **`--sheets`** does not work for sheet names containing **commas** — omit it and use `--file` only. **Global Integrated Power** is huge (~180k+ rows on *Power facilities*); full default run is slow. Skip `*.zip` GIS for v1. **Done:** **JODI** [`load_jodi.py`](loaders/load_jodi.py); **USGS** [`load_usgs.py`](loaders/load_usgs.py).
 
 **Pullers (all log `pipeline_runs`):**
 
@@ -28,13 +32,15 @@ This note is for the next agent or developer picking up the repo. The canonical 
 
 | Script | Tables |
 |--------|--------|
-| [load_baci.py](loaders/load_baci.py) | `bilateral_trade` |
+| [load_baci.py](loaders/load_baci.py) | `bilateral_trade` — base HS filter in script; optional **`--exporter-full-hs`** / **`--importer-full-hs`** for full legs; **`--hs6-codes`** / **`--hs6-codes-file`** for **global** flows (all partners) for listed HS6 (needed for credible “world share” in **Group dependencies**) |
 | [load_cepi_beyond_baci.py](loaders/load_cepi_beyond_baci.py) | `cepii_protee_hs6`, `cepii_geodep_import_dependence` |
 | [load_jodi.py](loaders/load_jodi.py) | `jodi_energy_observations` |
 | [load_usgs.py](loaders/load_usgs.py) | `usgs_mineral_statistics` (`mcs`); `usgs_myb3_production` + `usgs_country_mineral_facilities` (`facilities` / `myb3*.xlsx`) |
-| [load_gem_xlsx.py](loaders/load_gem_xlsx.py) | `gem_tracker_rows` (default GEM `.xlsx` bundle under `data/globalenergymonitor/`) |
+| [load_gem_xlsx.py](loaders/load_gem_xlsx.py) | `gem_tracker_rows` (default bundle: 8 workbooks — see README **load_gem_xlsx** table + `DEFAULT_WORKBOOKS` in script) |
 
 **CEPII beyond BACI (what it is vs `bilateral_trade`):** BACI = reconciled **bilateral flows** (exporter, importer, HS6, value, qty). **ProTEE** = one row per HS6 **import-demand elasticity** + flags (not flows; HS **2007** in CEPII’s file). **GeoDep** = importer × HS6 × year **dependence diagnostics** (HHI, persistence, top supplier code) derived from BACI — not a replacement for flow-level rows. **WTFC/CHELEM zips** in `data/cepi/` are documented in [README.md](README.md) but have **no loader** yet (huge HS96 CSVs). Full semantics: module docstring in `load_cepi_beyond_baci.py` and README **Loaders** subsection.
+
+**Group dependencies (Streamlit section):** Computes Gulf (or any chosen ISO3 group) **share of world exports** by HS6, within-group concentration, and importer exposure. **World denominator** requires **`bilateral_trade`** rows for **all exporters** for that HS6 × year — not only Gulf legs. If you only loaded regional BACI, shares can look wrong (e.g. 100% for a product). Fix: run `load_baci.py` with **`--hs6-codes`** (or a file of HS6) for the products you care about (e.g. top-N HS6 by group value from a first pass). Re-run when the HS6 list or year changes. UI can **save** results to **`trade_group_dependency_snapshots`** / **`trade_group_dependency_rows`**; **Saved snapshots** expander (above the compute gate) can **load** a prior run without running **Load / compute** first. **`rpc_trade_distinct_exporters_for_year`** supplies the full exporter dropdown (not a truncated table scan).
 
 ---
 
@@ -128,6 +134,8 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 ### BACI — [loaders/load_baci.py](loaders/load_baci.py)
 
 - Discovers `BACI_HS*_Y*.csv` with **`rglob`** under [data/baci/](data/baci/) so CEPII’s versioned subfolders work. No matching files → clear error and **`pipeline_runs`**.
+- **`--hs6-codes`** / **`--hs6-codes-file`:** loads **global** bilateral rows for those HS6 (all exporter–importer pairs) for the chosen year(s). Use for **Group dependencies** world shares. Large lists → long runs; chunked upsert in loader.
+- **`NaN`** in qty/value must not reach JSON upserts — loader coerces missing numerics to **`None`**.
 
 ### CEPII ProTEE / GeoDep — [loaders/load_cepi_beyond_baci.py](loaders/load_cepi_beyond_baci.py)
 
@@ -154,8 +162,8 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 - **`country_lookup`** — schema only; no puller yet (optional manual seed for names / Gulf flags).
 - **`country_macro_indicators`** / **`food_balance_sheets`** — filled by `pull_worldbank_wdi.py` and `pull_faostat.py --dataset fbs` (or `all`) after schema exists.
 - **`hs_code_lookup`** — run [pull_comtrade_hs_lookup.py](pullers/pull_comtrade_hs_lookup.py) once (or after Comtrade updates the JSON).
-- **Streamlit** — tabbed explorer (prices, BACI trade, crops, pipeline); no tabs yet for macro/FBS/energy/fertilizer, **CEPII ProTEE/GeoDep**, **`table_catalog`**, or future JODI/USGS/GEM.
-- **GEM** — default bundle: [`load_gem_xlsx.py`](loaders/load_gem_xlsx.py) → `gem_tracker_rows`; more trackers optional. **USGS MCS CSV** — `load_usgs.py mcs` + `usgs_mineral_statistics`. **USGS myb3** — `load_usgs.py facilities` + `usgs_myb3_production` / `usgs_country_mineral_facilities` (see **USGS myb3 yearbooks**). **JODI** — `load_jodi.py` + `jodi_energy_observations`.
+- **Streamlit** — main tabs: prices, BACI trade, country profile, **Exporter & partners**, **Group dependencies**, crops, pipeline, **Explore more**. **Explore more** includes macro (WDI), FBS, EIA energy, fertilizer, ProTEE, GeoDep, **JODI**, **USGS** (three table modes), **GEM**, **HS6** lookup, `table_catalog`, `country_lookup` — large sources use filter + row limits in [app/streamlit_app.py](app/streamlit_app.py).
+- **GEM** — extend beyond default eight workbooks: edit [`DEFAULT_WORKBOOKS`](loaders/load_gem_xlsx.py) or use `--file`. **USGS MCS CSV** — `load_usgs.py mcs` + `usgs_mineral_statistics`. **USGS myb3** — `load_usgs.py facilities` + `usgs_myb3_production` / `usgs_country_mineral_facilities` (see **USGS myb3 yearbooks**). **JODI** — `load_jodi.py` + `jodi_energy_observations`.
 - **WTFC / CHELEM zips** under `data/cepi/` — no loader (entire WTFC family deferred, including CHELEM price_range/type zips).
 - **GEM GIS `*.zip`** (geojson/gpkg) — intentionally **deferred**; tabular `.xlsx` first.
 - **Pagination / offset** for EIA/USDA when responses exceed **5000** rows (OK for current year ranges; fragile if ranges widen).
@@ -171,19 +179,42 @@ Never commit `.env`. **Do not put live JWTs or passwords in `.env.example`** (pl
 5. **Pink Sheet URL** and **EIA routes** are **external drift** risks — failures are often “update constant / facet / path”, not “random bug”.
 6. **FAOSTAT `faostat` client:** do not call **`set_requests_args`** multiple times in one process (package bug: **`__BASE_URL__`** keeps growing).
 7. **FAOSTAT fertilizer API:** **`pars={'area': 'all'}`** (or similar) returns **no rows** — the puller must send **explicit FAO area codes** in chunks (see script).
+8. **GEM `load_gem_xlsx.py`:** Do not pass **`--sheets "..., ..."`** when a sheet name **contains a comma** (e.g. *Regions, area, and countries*) — splits wrong. Use **`--file workbook.xlsx`** without `--sheets` to load all non-About/Metadata sheets, or extend **`DEFAULT_WORKBOOKS`** with explicit sheet names.
+
+---
+
+## GEM default bundle (`gem_tracker_rows`)
+
+**Loader:** `uv run python loaders/load_gem_xlsx.py` (or `--dry-run`). **Table:** `gem_tracker_rows`; **DDL / catalog:** [`schema/create_tables.sql`](schema/create_tables.sql), [`schema/seed_table_catalog.sql`](schema/seed_table_catalog.sql).
+
+**Workbooks (data sheets only)** — filenames must match under [`data/globalenergymonitor/`](data/globalenergymonitor/):
+
+| File | Sheets |
+|------|--------|
+| `Global-Cement-and-Concrete-Tracker_July-2025.xlsx` | Plant Data |
+| `Global-Iron-Ore-Mines-Tracker-August-2025-V1.xlsx` | Main Data |
+| `Plant-level-data-Global-Chemicals-Inventory-November-2025-V1.xlsx` | Plant data |
+| `Plant-level-data-Global-Iron-and-Steel-Tracker-March-2026-V1.xlsx` | Plant data; Plant capacities and status; Plant production |
+| `GEM-GOIT-Oil-NGL-Pipelines-2025-03.xlsx` | Pipelines |
+| `GEM-GGIT-LNG-Terminals-2025-09.xlsx` | LNG Terminals |
+| `GEM-GGIT-Gas-Pipelines-2025-11.xlsx` | Pipelines |
+| `Global-Integrated-Power-March-2026-II.xlsx` | Power facilities; Regions, area, and countries |
+
+**Semantics:** Per `(source_file, sheet_name)`, existing rows are **deleted**, then data rows inserted (batched). **`openpyxl` read-only** streaming. Same physical workbook can contribute **multiple `sheet_name` values** (e.g. iron/steel three sheets).
 
 ---
 
 ## Next steps (suggested order)
 
 1. **Schema:** Apply [schema/create_tables.sql](schema/create_tables.sql) (SQL Editor, `psql`, or Supabase **`apply_migration`** via MCP if configured).
-2. **HS reference:** `uv run python pullers/pull_comtrade_hs_lookup.py` (Comtrade JSON → `hs_code_lookup`).
-3. **BACI:** CEPII CSVs → `data/baci/` → `uv run python loaders/load_baci.py --all` (or `--year YYYY`).
-4. **Pullers:** Run the rest per [README — Running Everything](README.md#running-everything-first-time). **USDA** needs **`USDA_FAS_API_KEY`**. **FAOSTAT fertilizer** needs FAO API token or user/pass for the fertilizer leg of `--dataset all`.
-5. **Verify:** `SELECT * FROM pipeline_runs ORDER BY completed_at DESC LIMIT 20;` and row counts per table.
-6. **Streamlit:** `uv run streamlit run app/streamlit_app.py` — prefer **`get_read_client()`** + anon key for anything exposed beyond localhost.
-7. **Optional:** Seed `country_lookup`; production RLS; CI / smoke tests.
-8. **Next data wave:** extend **GEM** (`load_gem_xlsx.py` / more `.xlsx`). **JODI:** `uv run python loaders/load_jodi.py`. **USGS:** `uv run python loaders/load_usgs.py mcs` (MCS CSV); **`uv run python loaders/load_usgs.py facilities`** (myb3 `*.xlsx`).
+2. **RPCs:** Apply [schema/rpc_trade_dashboards.sql](schema/rpc_trade_dashboards.sql) (Streamlit trade tabs + Group dependencies).
+3. **HS reference:** `uv run python pullers/pull_comtrade_hs_lookup.py` (Comtrade JSON → `hs_code_lookup`).
+4. **BACI:** CEPII CSVs → `data/baci/` → `uv run python loaders/load_baci.py --all` (or `--year YYYY`). For **Group dependencies** with correct world shares, also load global rows for the HS6 set you analyze, e.g. `uv run python loaders/load_baci.py --year 2024 --hs6-codes-file path/to/top_hs6.txt`.
+5. **Pullers:** Run the rest per [README — Running Everything](README.md#running-everything-first-time). **USDA** needs **`USDA_FAS_API_KEY`**. **FAOSTAT fertilizer** needs FAO API token or user/pass for the fertilizer leg of `--dataset all`.
+6. **Verify:** `SELECT * FROM pipeline_runs ORDER BY completed_at DESC LIMIT 20;` and row counts per table.
+7. **Streamlit:** `uv run streamlit run app/streamlit_app.py` (optional: `--server.port 8504`) — prefer **`get_read_client()`** + anon key for anything exposed beyond localhost.
+8. **Optional:** Seed `country_lookup`; production RLS; CI / smoke tests.
+9. **Next data wave:** extend **GEM** (`load_gem_xlsx.py` / more `.xlsx`). **JODI:** `uv run python loaders/load_jodi.py`. **USGS:** `uv run python loaders/load_usgs.py mcs` (MCS CSV); **`uv run python loaders/load_usgs.py facilities`** (myb3 `*.xlsx`).
 
 ---
 
@@ -220,9 +251,12 @@ uv run streamlit run app/streamlit_app.py
 | [utils/supabase_client.py](utils/supabase_client.py) | `get_client()`, `get_read_client()` |
 | [utils/pipeline_logger.py](utils/pipeline_logger.py) | `start_run` / `finish_run` → `pipeline_runs` |
 | [schema/create_tables.sql](schema/create_tables.sql) | Full DDL + upsert `UNIQUE` targets + `table_catalog` seed |
+| [schema/rpc_trade_dashboards.sql](schema/rpc_trade_dashboards.sql) | Trade RPCs for Streamlit (Exporter & partners, Group dependencies, distinct exporters) |
 | [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql) | Idempotent `table_catalog` row updates only |
+| [app/streamlit_app.py](app/streamlit_app.py) | Streamlit explorer — trade tabs, snapshot save/load for Group dependencies |
 | [loaders/load_cepi_beyond_baci.py](loaders/load_cepi_beyond_baci.py) | CEPII ProTEE / GeoDep loaders + dataset semantics |
 | [loaders/load_usgs.py](loaders/load_usgs.py) | USGS MCS CSV (`mcs`); myb3 country xlsx (`facilities`) → `usgs_myb3_*` tables |
+| [loaders/load_gem_xlsx.py](loaders/load_gem_xlsx.py) | GEM `.xlsx` → `gem_tracker_rows` (default 8-workbook bundle) |
 | [README.md](README.md) | User-facing spec, puller docs, schema, HS scope, future roadmap |
 
 ---

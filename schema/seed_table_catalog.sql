@@ -47,11 +47,31 @@ INSERT INTO table_catalog (
     'public',
     'bilateral_trade',
     'Bilateral merchandise trade (BACI)',
-    'CEPII BACI reconciled bilateral flows at HS6: trade value in USD thousands and quantity in metric tonnes. Filtered in the loader to V1 HS chapters (energy, fertilizers, crops). Central table for who trades what with whom.',
+    'CEPII BACI reconciled bilateral flows at HS6: trade value in USD thousands and quantity in metric tonnes. Default loader filter is V1 HS chapters; optional --exporter-full-hs / --importer-full-hs add all-HS6 rows for those legs (Exporter & partners tab).',
     'One row per exporter, importer, HS6 code, calendar year.',
     'exporter, importer, hs6_code, data_year',
     'loaders/load_baci.py',
     30
+),
+(
+    'public',
+    'trade_group_dependency_snapshots',
+    'Trade group dependency snapshots',
+    'Saved parameter sets and metadata for precomputed trade dependency analyses (country group + year + filters). Used by Streamlit to load results instantly without recomputing.',
+    'One row per parameter hash (group + year + filters).',
+    'params_hash',
+    'Streamlit UI (app/streamlit_app.py) using SQL RPC aggregates',
+    31
+),
+(
+    'public',
+    'trade_group_dependency_rows',
+    'Trade group dependency results',
+    'Materialized results for trade group dependency snapshots: export-side world-share by HS6 with single-point-of-failure metrics, and importer exposure slices for a selected HS6.',
+    'Many rows per snapshot (view_type × HS6, optionally importer).',
+    'snapshot_id, view_type, hs6_code, importer_iso3',
+    'Streamlit UI (app/streamlit_app.py) using SQL RPC aggregates',
+    32
 ),
 (
     'public',

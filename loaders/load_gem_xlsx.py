@@ -5,8 +5,8 @@
 # API KEY: not required
 # WRITES:  gem_tracker_rows
 # REFRESH: Re-download xlsx and re-run; each sheet is delete-then-insert for that source_file+sheet.
-# NOTES:   Default bundle = industrial/plant trackers + GGIT/GOIT pipelines/LNG (see DEFAULT_WORKBOOKS).
-#          Uses openpyxl read-only streaming. Skips About/Metadata unless you pass --include-meta-sheets.
+# NOTES:   Default bundle = industrial/plant trackers + GGIT/GOIT pipelines/LNG + Global Integrated Power
+#          (see DEFAULT_WORKBOOKS). openpyxl read-only. Skips About/Metadata unless --include-meta-sheets.
 # ============================================================
 
 from __future__ import annotations

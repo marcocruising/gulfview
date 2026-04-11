@@ -6,6 +6,8 @@
 # WRITES:  bilateral_trade
 # REFRESH: annual
 # NOTES:   Place BACI_HS*_Y*.csv files under data/baci/
+#          Optional --exporter-full-hs / --importer-full-hs load all HS6 for those
+#          legs so the app can show full supplier concentration (importer × HS6).
 # ============================================================
 
 # --- CONFIGURATION — edit these values before running --------
@@ -39,6 +41,7 @@ SOURCE_LABEL = "CEPII BACI (HS bilateral trade)"
 BACI_DIR = _ROOT / "data" / "baci"
 BACI_GLOB = "BACI_HS*_Y*.csv"
 UPSERT_BATCH = 800
+HS6_ALLOWLIST: set[str] = set()
 
 
 def _baci_numeric_to_iso3(code: int | float) -> str | None:
@@ -58,6 +61,9 @@ def _hs_allowed(hs6: str) -> bool:
     s = str(hs6).strip()
     if not s:
         return False
+    s6 = s.zfill(6)[:6]
+    if HS6_ALLOWLIST and s6 in HS6_ALLOWLIST:
+        return True
     for h in HS_CODES:
         h = str(h).strip()
         if len(h) == 6:
@@ -89,13 +95,105 @@ def _year_from_filename(path: Path) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _norm_iso3(token: str) -> str | None:
+    s = str(token).strip().upper()
+    if len(s) != 3 or not s.isalpha():
+        return None
+    return s
+
+
+def _include_row_mask(
+    df: pd.DataFrame,
+    *,
+    exporter_full_hs: str | None,
+    importers_full_hs: frozenset[str],
+) -> pd.Series:
+    """True if row should be loaded: V1 HS filter OR full-HS exporter/importer match."""
+    exp = df["i"].map(_baci_numeric_to_iso3)
+    imp = df["j"].map(_baci_numeric_to_iso3)
+    k = df["k"].astype(str)
+    hs_ok = k.map(_hs_allowed)
+    m = hs_ok
+    if exporter_full_hs:
+        m = m | (exp == exporter_full_hs)
+    if importers_full_hs:
+        m = m | imp.isin(set(importers_full_hs))
+    return m
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Load BACI CSV files into bilateral_trade.")
     ap.add_argument("--year", type=int, help="Only files for this reference year")
     ap.add_argument("--all", action="store_true", help="Load every BACI CSV under data/baci/")
+    ap.add_argument(
+        "--hs6-codes",
+        default="",
+        help="Comma-separated six-digit HS6 codes to additionally include globally (loads all exporters/importers for these codes).",
+    )
+    ap.add_argument(
+        "--hs6-codes-file",
+        default="",
+        help="Path to a text file listing HS6 codes (one per line) to additionally include globally.",
+    )
+    ap.add_argument(
+        "--exporter-full-hs",
+        metavar="ISO3",
+        default=None,
+        help="Also load all HS6 lines where exporter is this ISO3 (e.g. ARE for full UAE exports).",
+    )
+    ap.add_argument(
+        "--importer-full-hs",
+        action="append",
+        default=[],
+        metavar="ISO3",
+        help="Also load all HS6 lines where importer is this ISO3 (repeat for each partner). "
+        "Needed for best-fidelity supplier concentration in the app.",
+    )
     args = ap.parse_args()
     if not args.all and args.year is None:
         ap.error("Specify --year YYYY or --all")
+
+    global HS6_ALLOWLIST
+    HS6_ALLOWLIST = set()
+    if args.hs6_codes:
+        for tok in str(args.hs6_codes).split(","):
+            s = str(tok).strip()
+            if not s:
+                continue
+            if not s.isdigit():
+                print(f"Invalid HS6 code in --hs6-codes (digits only): {s!r}", file=sys.stderr)
+                return 1
+            HS6_ALLOWLIST.add(s.zfill(6)[:6])
+    if args.hs6_codes_file:
+        p = Path(str(args.hs6_codes_file)).expanduser()
+        if not p.is_file():
+            print(f"--hs6-codes-file not found: {str(p)!r}", file=sys.stderr)
+            return 1
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                if not s.isdigit():
+                    print(f"Invalid HS6 code in --hs6-codes-file (digits only): {s!r}", file=sys.stderr)
+                    return 1
+                HS6_ALLOWLIST.add(s.zfill(6)[:6])
+        except Exception as e:
+            print(f"Failed reading --hs6-codes-file: {e}", file=sys.stderr)
+            return 1
+
+    exporter_full = _norm_iso3(args.exporter_full_hs) if args.exporter_full_hs else None
+    if args.exporter_full_hs and exporter_full is None:
+        print(f"Invalid --exporter-full-hs (need 3-letter ISO3): {args.exporter_full_hs!r}", file=sys.stderr)
+        return 1
+    imp_set: set[str] = set()
+    for raw in args.importer_full_hs or []:
+        iso = _norm_iso3(raw)
+        if not iso:
+            print(f"Invalid --importer-full-hs (need 3-letter ISO3): {raw!r}", file=sys.stderr)
+            return 1
+        imp_set.add(iso)
+    importers_full_hs = frozenset(imp_set)
 
     try:
         client = get_client()
@@ -106,8 +204,11 @@ def main() -> int:
     params: dict[str, Any] = {
         "years": YEARS,
         "hs_codes": HS_CODES,
+        "hs6_allowlist": sorted(HS6_ALLOWLIST),
         "year_arg": args.year,
         "all": args.all,
+        "exporter_full_hs": exporter_full,
+        "importer_full_hs": sorted(imp_set),
     }
     try:
         run_id = start_run(client, SCRIPT_NAME, SOURCE_LABEL, params)
@@ -127,8 +228,8 @@ def main() -> int:
             return 1
 
         pulled_at = datetime.now(timezone.utc).isoformat()
-        rows: list[dict[str, Any]] = []
         files_used: list[str] = []
+        rows_written = 0
 
         for path in paths:
             data_year = _year_from_filename(path)
@@ -152,52 +253,59 @@ def main() -> int:
                 return 1
 
             files_used.append(path.name)
-            sub = df[df["k"].map(_hs_allowed)].copy()
-            qcol = "q" if "q" in sub.columns else None
-            for _, r in sub.iterrows():
-                exp = _baci_numeric_to_iso3(r["i"])
-                imp = _baci_numeric_to_iso3(r["j"])
-                if not exp or not imp:
-                    continue
-                qty = None
-                if qcol and pd.notna(r[qcol]):
-                    try:
-                        qty = float(r[qcol])
-                    except (TypeError, ValueError):
-                        qty = None
-                try:
-                    val = float(r["v"])
-                except (TypeError, ValueError):
-                    continue
-                hs6 = str(r["k"]).strip().zfill(6)[:6]
-                rows.append(
-                    {
-                        "exporter": exp,
-                        "importer": imp,
-                        "hs6_code": hs6,
-                        "hs_description": None,
-                        "trade_value_usd": val,
-                        "quantity_tonnes": qty,
-                        "data_year": int(r["t"]),
-                        "source": f"baci_{path.stem}",
-                        "pulled_at": pulled_at,
-                    }
-                )
+            mask = _include_row_mask(
+                df,
+                exporter_full_hs=exporter_full,
+                importers_full_hs=importers_full_hs,
+            )
+            sub = df.loc[mask, :].copy()
+            if sub.empty:
+                continue
 
-        if not rows:
-            msg = "No rows after HS/year filters (check YEARS and HS_CODES vs file contents)."
+            # Map numeric country codes to ISO3 using a small lookup dict (fast; avoids per-row pycountry calls).
+            i_vals = pd.Series(sub["i"].unique())
+            j_vals = pd.Series(sub["j"].unique())
+            i_map = {int(v): _baci_numeric_to_iso3(v) for v in i_vals.dropna().tolist()}
+            j_map = {int(v): _baci_numeric_to_iso3(v) for v in j_vals.dropna().tolist()}
+
+            sub["exporter"] = sub["i"].map(i_map)
+            sub["importer"] = sub["j"].map(j_map)
+            sub["hs6_code"] = sub["k"].astype(str).str.strip().str.zfill(6).str.slice(0, 6)
+            sub["trade_value_usd"] = pd.to_numeric(sub.get("v"), errors="coerce")
+            if "q" in sub.columns:
+                sub["quantity_tonnes"] = pd.to_numeric(sub.get("q"), errors="coerce")
+            else:
+                sub["quantity_tonnes"] = None
+
+            keep = sub["exporter"].notna() & sub["importer"].notna() & sub["trade_value_usd"].notna()
+            sub = sub.loc[keep, ["exporter", "importer", "hs6_code", "trade_value_usd", "quantity_tonnes", "t"]]
+            if sub.empty:
+                continue
+
+            sub = sub.rename(columns={"t": "data_year"})
+            sub["hs_description"] = None
+            sub["source"] = f"baci_{path.stem}"
+            sub["pulled_at"] = pulled_at
+            # Supabase JSON encoder rejects NaN/Inf. Convert float columns to object so None sticks.
+            sub = sub.astype(object).where(pd.notna(sub), None)
+
+            # Upsert in chunks to avoid large payloads.
+            records = sub.to_dict(orient="records")
+            for i in range(0, len(records), UPSERT_BATCH):
+                batch = records[i : i + UPSERT_BATCH]
+                client.table("bilateral_trade").upsert(
+                    batch, on_conflict="exporter,importer,hs6_code,data_year"
+                ).execute()
+            rows_written += len(records)
+
+        if rows_written <= 0:
+            msg = "No rows after HS/year filters (check YEARS and HS_CODES / HS6 allowlist vs file contents)."
             finish_run(client, run_id, 0, "partial", msg)
             print(msg, file=sys.stderr)
             return 0
 
-        for i in range(0, len(rows), UPSERT_BATCH):
-            batch = rows[i : i + UPSERT_BATCH]
-            client.table("bilateral_trade").upsert(
-                batch, on_conflict="exporter,importer,hs6_code,data_year"
-            ).execute()
-
-        finish_run(client, run_id, len(rows), "success", None)
-        print(f"Loaded {len(rows)} rows from {len(files_used)} file(s).")
+        finish_run(client, run_id, int(rows_written), "success", None)
+        print(f"Loaded {rows_written} rows from {len(files_used)} file(s).")
         return 0
     except Exception as e:
         err = f"{type(e).__name__}: {e}"

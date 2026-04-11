@@ -58,6 +58,66 @@ CREATE TABLE IF NOT EXISTS bilateral_trade (
     UNIQUE (exporter, importer, hs6_code, data_year)
 );
 
+CREATE INDEX IF NOT EXISTS idx_bilateral_trade_exporter_data_year ON bilateral_trade (exporter, data_year);
+CREATE INDEX IF NOT EXISTS idx_bilateral_trade_importer_hs6_year ON bilateral_trade (importer, hs6_code, data_year);
+
+-- Persisted trade dependency snapshots (computed aggregates to avoid recomputation in the UI).
+CREATE TABLE IF NOT EXISTS trade_group_dependency_snapshots (
+    id              SERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    data_year       INTEGER NOT NULL,
+    group_iso3      TEXT[] NOT NULL,
+    params_json     JSONB NOT NULL,
+    params_hash     TEXT NOT NULL UNIQUE,
+    status          TEXT NOT NULL DEFAULT 'success',
+    row_counts      JSONB,
+    started_at      TIMESTAMPTZ,
+    error_message   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_group_dependency_snapshots_year
+    ON trade_group_dependency_snapshots (data_year, computed_at DESC);
+
+CREATE TABLE IF NOT EXISTS trade_group_dependency_rows (
+    id                              SERIAL PRIMARY KEY,
+    snapshot_id                     INTEGER NOT NULL REFERENCES trade_group_dependency_snapshots(id) ON DELETE CASCADE,
+    view_type                       TEXT NOT NULL, -- 'export_world_share' | 'importer_exposure'
+    hs6_code                        TEXT NOT NULL,
+    importer_iso3                   TEXT, -- null for export view
+
+    -- Common metrics
+    group_export_usd_k              NUMERIC,
+    world_export_usd_k              NUMERIC,
+    group_share_pct                 NUMERIC,
+
+    -- Export-side single-point-of-failure inside group
+    top_group_exporter_iso3         TEXT,
+    top_group_exporter_share_pct    NUMERIC,
+    group_member_hhi                NUMERIC,
+    group_exporter_count            INTEGER,
+
+    -- Importer exposure metrics
+    importer_total_import_usd_k     NUMERIC,
+    imports_from_group_usd_k        NUMERIC,
+    exposure_pct                    NUMERIC,
+    supplier_total_hhi              NUMERIC,
+    supplier_cr1_pct                NUMERIC,
+    supplier_cr3_pct                NUMERIC,
+    group_supplier_hhi              NUMERIC,
+    group_supplier_cr1_pct          NUMERIC,
+
+    extra_json                      JSONB,
+
+    UNIQUE (snapshot_id, view_type, hs6_code, importer_iso3)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_group_dependency_rows_snapshot_view
+    ON trade_group_dependency_rows (snapshot_id, view_type);
+
+CREATE INDEX IF NOT EXISTS idx_trade_group_dependency_rows_hs6
+    ON trade_group_dependency_rows (hs6_code);
+
 CREATE TABLE IF NOT EXISTS fertilizer_production (
     id              SERIAL PRIMARY KEY,
     country         TEXT NOT NULL,
@@ -302,6 +362,9 @@ CREATE INDEX IF NOT EXISTS idx_gem_tracker_payload_gin
 
 ALTER TABLE gem_tracker_rows DISABLE ROW LEVEL SECURITY;
 
+ALTER TABLE trade_group_dependency_snapshots DISABLE ROW LEVEL SECURITY;
+ALTER TABLE trade_group_dependency_rows DISABLE ROW LEVEL SECURITY;
+
 CREATE INDEX IF NOT EXISTS idx_cepii_geodep_country_year
     ON cepii_geodep_import_dependence (country, data_year);
 
@@ -373,6 +436,26 @@ INSERT INTO table_catalog (
     'exporter, importer, hs6_code, data_year',
     'loaders/load_baci.py',
     30
+),
+(
+    'public',
+    'trade_group_dependency_snapshots',
+    'Trade group dependency snapshots',
+    'Saved parameter sets and metadata for precomputed trade dependency analyses (country group + year + filters). Used by Streamlit to load results instantly without recomputing.',
+    'One row per parameter hash (group + year + filters).',
+    'params_hash',
+    'Streamlit UI (app/streamlit_app.py) using SQL RPC aggregates',
+    31
+),
+(
+    'public',
+    'trade_group_dependency_rows',
+    'Trade group dependency results',
+    'Materialized results for trade group dependency snapshots: export-side world-share by HS6 with single-point-of-failure metrics, and importer exposure slices for a selected HS6.',
+    'Many rows per snapshot (view_type × HS6, optionally importer).',
+    'snapshot_id, view_type, hs6_code, importer_iso3',
+    'Streamlit UI (app/streamlit_app.py) using SQL RPC aggregates',
+    32
 ),
 (
     'public',

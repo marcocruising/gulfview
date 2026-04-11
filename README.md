@@ -33,6 +33,7 @@ hormuz-supply-chain/
 │
 ├── schema/
 │   └── create_tables.sql            # full Supabase schema — run once
+│   └── rpc_trade_dashboards.sql     # SQL RPCs used by Streamlit trade drill-down (apply to Supabase)
 │
 ├── pullers/                         # scripts that fetch remote data (HTTP API or published file) and write to Supabase
 │   ├── pull_eia.py                  # EIA: crude/LNG/refined product flows
@@ -50,11 +51,19 @@ hormuz-supply-chain/
 │   └── load_gem_xlsx.py             # GEM: selected .xlsx → gem_tracker_rows (JSON per row)
 │
 ├── app/
-│   └── streamlit_app.py             # data explorer UI — reads from Supabase only
+│   └── streamlit_app.py             # data explorer UI — reads from Supabase only (sidebar sections; see below)
+│
+├── scripts/
+│   ├── verify.sh                    # py_compile + unit tests (used in CI-style checks)
+│   └── run_group_dependency_snapshot.py  # CLI: same snapshot write as Group dependencies tab
+│
+├── tests/
+│   └── test_group_dependency_compute.py  # hash + RPC payload tests (no live DB)
 │
 └── utils/
     ├── supabase_client.py           # shared Supabase connection
-    └── pipeline_logger.py           # shared pipeline run logging
+    ├── pipeline_logger.py           # shared pipeline run logging
+    └── group_dependency_compute.py  # shared group-dependency snapshot + RPC helpers (Streamlit + CLI)
 ```
 
 ### Local data folders — what is loaded vs planned
@@ -117,6 +126,13 @@ Apply [schema/create_tables.sql](schema/create_tables.sql) once to your Supabase
 # Option A: Supabase Dashboard → SQL Editor → paste the file and run
 # Option B: psql with your Postgres connection string
 psql "$DATABASE_URL" -f schema/create_tables.sql
+```
+
+Apply trade dashboard RPCs used by Streamlit (safe to re-run; creates/replaces SQL functions + supporting indexes). This file includes **Exporter & partners** aggregates, **`rpc_trade_distinct_exporters_for_year`** (full exporter list per year), and **Group dependencies** RPCs; heavy group-share functions run as `plpgsql` with an extended **`statement_timeout`** (120s) to reduce PostgREST timeouts on large `bilateral_trade` scans.
+```bash
+# Option A: Supabase Dashboard → SQL Editor → run the file
+# Option B: psql
+psql "$DATABASE_URL" -f schema/rpc_trade_dashboards.sql
 ```
 
 To refresh dictionary text only (without re-running the whole schema file), use [schema/seed_table_catalog.sql](schema/seed_table_catalog.sql).
@@ -203,6 +219,9 @@ source          TEXT              -- 'baci_2022' etc.
 pulled_at       TIMESTAMPTZ
 UNIQUE (exporter, importer, hs6_code, data_year)
 ```
+
+#### `trade_group_dependency_snapshots` / `trade_group_dependency_rows`
+Persisted results for the Streamlit **Group dependencies** tab: parameter hash (`params_hash`), year, country group, and materialized export/importer-exposure rows so analyses can be reopened without recomputing. Populated by the app when you click **Load / compute** (not by a puller). See [`schema/create_tables.sql`](schema/create_tables.sql).
 
 #### `fertilizer_production`
 Fertilizer production and trade by country, from FAOSTAT.
@@ -418,6 +437,22 @@ pulled_at                  TIMESTAMPTZ
 
 **`commodity_cell_raw` / `commodity_leaf_resolved`:** For USGS **`Do.`** rows both hold the **resolved** commodity text (same value) so nothing is blank in the UI.
 
+#### `gem_tracker_rows`
+Rows from [Global Energy Monitor](https://www.globalenergymonitor.org/) **`.xlsx`** trackers loaded by [`loaders/load_gem_xlsx.py`](loaders/load_gem_xlsx.py). Each spreadsheet **data row** is one database row; column headers from row 1 become keys on **`payload`** (JSONB). Provenance: **`source_file`** (workbook filename), **`sheet_name`**, **`excel_row_1based`** (Excel row index; header is row 1). **`source`** is the loader script name; **`pulled_at`** is insert time.
+
+```sql
+id                  SERIAL PRIMARY KEY
+source_file         TEXT NOT NULL
+sheet_name          TEXT NOT NULL
+excel_row_1based    INTEGER NOT NULL
+payload             JSONB NOT NULL
+source              TEXT NOT NULL
+pulled_at           TIMESTAMPTZ NOT NULL
+UNIQUE (source_file, sheet_name, excel_row_1based)
+```
+
+Reloading a sheet **deletes** existing rows for that `(source_file, sheet_name)` pair, then inserts fresh rows (idempotent full refresh per sheet).
+
 ---
 
 ## HS Codes in Scope (V1)
@@ -615,10 +650,25 @@ uv run python loaders/load_baci.py --year 2022
 
 # Load all CSV files found in data/baci/
 uv run python loaders/load_baci.py --all
+
+# Optional: all HS6 lines for one exporter (e.g. ARE) — Streamlit tab “Exporter & partners”
+uv run python loaders/load_baci.py --all --exporter-full-hs ARE
+
+# Optional: repeat --importer-full-hs for each partner ISO3 so the app can show full supplier
+# concentration (every exporter → that importer × HS6). Combine with the line above as needed.
+uv run python loaders/load_baci.py --all --exporter-full-hs ARE --importer-full-hs IND
+
+# Optional: load global BACI flows for specific HS6 codes (all exporters × all importers)
+# — use when you need a true “world exports” denominator for those products (e.g. Group dependencies).
+uv run python loaders/load_baci.py --year 2024 --hs6-codes "270900,851713"
+# Or list codes one per line in a file:
+# uv run python loaders/load_baci.py --year 2024 --hs6-codes-file path/to/hs6.txt
 ```
 
 The loader filters to only the HS codes in scope (defined at the top of the script) so it does
 not try to load all 5,000 products. This keeps DB size manageable and load time fast.
+**`--exporter-full-hs`** and **`--importer-full-hs`** *add* rows outside that list for the given ISO3 legs (other flows stay V1-filtered).
+**`--hs6-codes`** / **`--hs6-codes-file`** *add* rows for those six-digit HS6 codes globally (all partner legs), which is what makes “% of world exports” meaningful for selected products.
 
 **Known limitation:** Annual only, no monthly granularity. Use Comtrade API (future v2)
 for more recent or more specific bilateral queries.
@@ -702,14 +752,29 @@ uv run python loaders/load_usgs.py facilities   # myb3-*.xlsx → usgs_myb3_prod
 
 ### `load_gem_xlsx.py` — Global Energy Monitor (default bundle)
 
-**Writes to:** `gem_tracker_rows` — one row per Excel data line; headers become keys on **`payload`** (JSONB).
+**Writes to:** `gem_tracker_rows` — one row per Excel data line; headers become keys on **`payload`** (JSONB). **`About`** and **`Metadata`** sheets are skipped unless you use `--include-meta-sheets` with `--file`.
 
-**Default** (no args) loads data sheets from eight workbooks: the four industrial/plant trackers above (six sheets total) plus **GEM-GOIT-Oil-NGL-Pipelines** (`Pipelines`), **GEM-GGIT-LNG-Terminals** (`LNG Terminals`), **GEM-GGIT-Gas-Pipelines** (`Pipelines`), **Global Integrated Power** (`Power facilities`, `Regions, area, and countries`).
+**Default bundle** (no args): eight workbooks under `data/globalenergymonitor/`, data sheets only — keep filenames aligned with [`DEFAULT_WORKBOOKS`](loaders/load_gem_xlsx.py) in the script.
+
+| Workbook `.xlsx` | Sheet(s) loaded |
+|------------------|-----------------|
+| `Global-Cement-and-Concrete-Tracker_July-2025.xlsx` | Plant Data |
+| `Global-Iron-Ore-Mines-Tracker-August-2025-V1.xlsx` | Main Data |
+| `Plant-level-data-Global-Chemicals-Inventory-November-2025-V1.xlsx` | Plant data |
+| `Plant-level-data-Global-Iron-and-Steel-Tracker-March-2026-V1.xlsx` | Plant data; Plant capacities and status; Plant production |
+| `GEM-GOIT-Oil-NGL-Pipelines-2025-03.xlsx` | Pipelines |
+| `GEM-GGIT-LNG-Terminals-2025-09.xlsx` | LNG Terminals |
+| `GEM-GGIT-Gas-Pipelines-2025-11.xlsx` | Pipelines |
+| `Global-Integrated-Power-March-2026-II.xlsx` | Power facilities; Regions, area, and countries |
+
+**Performance:** `Global-Integrated-Power-*.xlsx` is large (~180k+ data rows on **Power facilities** alone); a full default run can take **many minutes**. Use `--dry-run` first, or `--file Some.xlsx` to refresh one workbook.
+
+**CLI notes:** With `--file`, every sheet except **About** / **Metadata** is loaded. **`--sheets`** accepts comma-separated names and does **not** support sheet titles that contain commas (e.g. use `--file` without `--sheets` for *Regions, area, and countries*). **`--sheets`** is only valid with a **single** `--file`.
 
 ```bash
 uv run python loaders/load_gem_xlsx.py --dry-run   # parse only; print row counts
-uv run python loaders/load_gem_xlsx.py             # needs Supabase + `gem_tracker_rows` in schema
-uv run python loaders/load_gem_xlsx.py --file Other.xlsx   # all sheets except About/Metadata
+uv run python loaders/load_gem_xlsx.py             # full default bundle; needs gem_tracker_rows in schema
+uv run python loaders/load_gem_xlsx.py --file Global-Integrated-Power-March-2026-II.xlsx
 ```
 
 ---
@@ -736,6 +801,10 @@ uv run python loaders/load_baci.py --all
 # 4c. Optional — USGS in data/usgs/
 # uv run python loaders/load_usgs.py mcs
 # uv run python loaders/load_usgs.py facilities   # myb3-*.xlsx
+
+# 4d. Optional — GEM .xlsx under data/globalenergymonitor/ (see load_gem_xlsx default bundle)
+# uv run python loaders/load_gem_xlsx.py --dry-run
+# uv run python loaders/load_gem_xlsx.py
 
 # 5. Run remaining pullers (FAOSTAT --dataset all needs FAO API creds for the fertilizer leg; use --dataset crops|fbs to skip)
 uv run python pullers/pull_eia.py
@@ -778,17 +847,26 @@ ORDER BY completed_at DESC;
 
 ## Streamlit Data Explorer (V1)
 
-The V1 app is a **tabbed** dashboard (not a generic “pick any table” grid). There is no derived Hormuz exposure score yet — the goal is to sanity-check data and joins.
+The V1 app is **not** a generic “pick any table” grid. Navigation is a **sidebar “Section” radio** (eight areas). That matters for performance: Streamlit’s `st.tabs` runs **every** tab’s Python on **each** widget interaction, which used to reload the whole dashboard (all eight areas) whenever you moved a slider. The sidebar pattern runs **only the selected section** on each rerun.
 
-| Tab | What it shows |
+The **Group dependencies** section is also wrapped in **`@st.fragment()`**, so sliders and controls inside it can update with a **partial rerun** instead of re-executing the rest of the app. Heavy Supabase RPCs there run on **Load / compute** (or when viewing a cached result for the same parameters / a loaded snapshot), not on every widget tweak.
+
+There is no derived Hormuz exposure score yet — the goal is to sanity-check data and joins.
+
+| Section | What it shows |
 |-----|----------------|
 | **Prices over time** | `commodity_prices` (World Bank Pink Sheet monthly series) |
-| **Who trades what** | Top exporters/importers from `bilateral_trade` by HS6 and year |
-| **Country profile** | Per-country import/export totals by HS6 for one year (joins `hs_code_lookup` for descriptions when present) |
+| **Who trades what** | Top exporters/importers from `bilateral_trade` by HS6 and year (server-filtered by year × HS6) |
+| **Country profile** | Per-country import/export totals by HS6 for one year (server-filtered; joins `hs_code_lookup` when present) |
+| **Exporter & partners** | Pick an **exporter** (Gulf pinned at top), year, HS search, and top‑N, then click **Load data**. Partner and supplier panels are **stepwise** buttons to avoid unwanted queries. Uses trade RPCs in [`schema/rpc_trade_dashboards.sql`](schema/rpc_trade_dashboards.sql) for fast aggregates. Best‑fidelity supplier concentration requires importer legs loaded via `load_baci.py --importer-full-hs`. |
+| **Group dependencies** | Choose a **country group** (default Gulf ISO3), year, HS filter, and top‑N HS6 by group export share of **world** flows. Shows within‑group concentration and importer exposure to the group for a selected HS6; can **save snapshots** to `trade_group_dependency_*` tables; **Saved snapshots** expander can load a prior run without recomputing. PostgREST RPC calls must use Postgres parameter names **`p_data_year`** / **`p_hs6_code`** (not `data_year` / `hs6_code`). Requires [`schema/rpc_trade_dashboards.sql`](schema/rpc_trade_dashboards.sql) (group RPCs). For credible world shares per HS6, load global flows for those codes via `load_baci.py --hs6-codes` (or the UI will reflect only what is in `bilateral_trade`). |
 | **Crop production** | `crop_production` rankings by crop, metric, year |
 | **Pipeline status** | Recent `pipeline_runs` and latest run per script |
+| **Explore more** | Additional datasets (nested tabs — all read Supabase with **bounded** queries where tables are large) |
 
-**Not in the UI yet:** dedicated views for `country_macro_indicators`, `food_balance_sheets`, `energy_trade_flows`, or `fertilizer_production` — query those in SQL or extend the app when needed.
+**Explore more** sub-tabs: **`table_catalog`** (data dictionary); **`energy_trade_flows`** (EIA); **`fertilizer_production`**; **`country_macro_indicators`** (WDI); **`food_balance_sheets`**; **`cepii_protee_hs6`** / **`cepii_geodep_import_dependence`** (GeoDep filtered + row limit); **`jodi_energy_observations`** (requires country and/or product/flow filters); **USGS** — `usgs_mineral_statistics`, `usgs_myb3_production`, `usgs_country_mineral_facilities` (each mode requires ISO3 and/or other filters); **`gem_tracker_rows`** (exact workbook filename + sheet + limit); **`hs_code_lookup`** (browse/filter); **`country_lookup`**.
+
+There is still no generic “dump any table” grid. **Not in Postgres yet (no loader):** CEPII WTFC/CHELEM zips. **GEM GIS** `.zip` assets are deferred.
 
 ```bash
 uv run streamlit run app/streamlit_app.py
@@ -811,7 +889,7 @@ The app should read Supabase settings from `.env` via python-dotenv — use `get
 | Exposure scores not computed | Raw data only, no derived Hormuz dependency index | Build iteratively once data is validated |
 | Pink Sheet XLSX URL can 404 after WB republish | Pull fails until `PINK_SHEET_MONTHLY_XLSX_URL` is updated; check `pipeline_runs.error_message` | Manual URL refresh from World Bank doc page (script logs instructions) |
 | USGS myb3 not loaded | Empty `usgs_myb3_*` tables | Place `myb3-*.xlsx` under `data/usgs/` and run `uv run python loaders/load_usgs.py facilities` |
-| GEM default bundle not loaded | Empty `gem_tracker_rows` | Apply `gem_tracker_rows` DDL from [`schema/create_tables.sql`](schema/create_tables.sql), then `uv run python loaders/load_gem_xlsx.py` |
+| GEM default bundle not loaded | Empty or stale `gem_tracker_rows` | Ensure DDL from [`schema/create_tables.sql`](schema/create_tables.sql); place default `.xlsx` files under `data/globalenergymonitor/`; run `uv run python loaders/load_gem_xlsx.py` (or `--file` for one workbook) |
 | JODI gas CSV is long history | Large row count if you use `--all-years` | Default `load_jodi.py` keeps `data_year >= 2020` (~39% of current gas export); override with `--min-year` / `--all-years` |
 
 ---

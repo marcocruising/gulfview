@@ -4,7 +4,9 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from httpx import Timeout
 from supabase import Client, create_client
+from supabase.lib.client_options import SyncClientOptions
 
 
 def _project_root() -> Path:
@@ -35,6 +37,15 @@ def _get_anon_or_publishable_key() -> str | None:
     )
 
 
+def _sync_client_options() -> SyncClientOptions:
+    """PostgREST read timeout >= long DISTINCT RPCs (DB uses up to 120s) plus margin."""
+    sec = float(os.environ.get("SUPABASE_POSTGREST_TIMEOUT_SEC", "180"))
+    if sec < 30:
+        sec = 30.0
+    connect = min(30.0, sec)
+    return SyncClientOptions(postgrest_client_timeout=Timeout(sec, connect=connect))
+
+
 def get_client() -> Client:
     """Supabase client with write access (service role or secret key). Used by pullers and loaders."""
     load_dotenv(_project_root() / ".env")
@@ -46,7 +57,7 @@ def get_client() -> Client:
             "Use SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SECRET_KEY "
             "(see .env.example). Legacy SUPABASE_KEY is also accepted."
         )
-    return create_client(url, key)
+    return create_client(url, key, _sync_client_options())
 
 
 def get_read_client() -> Client:
@@ -59,4 +70,4 @@ def get_read_client() -> Client:
             "Set SUPABASE_URL and SUPABASE_ANON_PUBLIC_KEY or SUPABASE_PUBLISHABLE_KEY in .env "
             "(see .env.example)."
         )
-    return create_client(url, key)
+    return create_client(url, key, _sync_client_options())

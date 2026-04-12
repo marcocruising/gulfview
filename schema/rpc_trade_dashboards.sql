@@ -207,17 +207,23 @@ GROUP BY t.total_usd_k, t.n_suppliers;
 $$;
 
 -- Distinct exporters present in BACI (any year).
+-- plpgsql + statement_timeout: full-table DISTINCT can exceed default DB/proxy limits; clients may
+-- otherwise see httpx RemoteProtocolError (“Server disconnected”) with no JSON body instead of 57014.
 CREATE OR REPLACE FUNCTION public.rpc_trade_distinct_exporters()
 RETURNS TABLE (
     exporter_iso3 text
 )
-LANGUAGE sql
+LANGUAGE plpgsql
 STABLE
 AS $$
-SELECT DISTINCT bt.exporter AS exporter_iso3
-FROM public.bilateral_trade bt
-WHERE bt.exporter IS NOT NULL AND TRIM(bt.exporter) <> ''
-ORDER BY bt.exporter;
+BEGIN
+  PERFORM set_config('statement_timeout', '120000', true);
+  RETURN QUERY
+  SELECT DISTINCT bt.exporter AS exporter_iso3
+  FROM public.bilateral_trade bt
+  WHERE bt.exporter IS NOT NULL AND TRIM(bt.exporter) <> ''
+  ORDER BY bt.exporter;
+END;
 $$;
 
 -- Distinct exporters present in BACI for one year (complete list; avoids capped client scans).
@@ -225,14 +231,18 @@ CREATE OR REPLACE FUNCTION public.rpc_trade_distinct_exporters_for_year(p_data_y
 RETURNS TABLE (
     exporter_iso3 text
 )
-LANGUAGE sql
+LANGUAGE plpgsql
 STABLE
 AS $$
-SELECT DISTINCT bt.exporter AS exporter_iso3
-FROM public.bilateral_trade bt
-WHERE bt.data_year = p_data_year
-  AND bt.exporter IS NOT NULL AND TRIM(bt.exporter) <> ''
-ORDER BY bt.exporter;
+BEGIN
+  PERFORM set_config('statement_timeout', '120000', true);
+  RETURN QUERY
+  SELECT DISTINCT bt.exporter AS exporter_iso3
+  FROM public.bilateral_trade bt
+  WHERE bt.data_year = p_data_year
+    AND bt.exporter IS NOT NULL AND TRIM(bt.exporter) <> ''
+  ORDER BY bt.exporter;
+END;
 $$;
 
 -- Distinct HS6 codes present in BACI for one year (complete list; avoids capped client row scans).
@@ -240,14 +250,18 @@ CREATE OR REPLACE FUNCTION public.rpc_trade_distinct_hs6_for_year(p_data_year in
 RETURNS TABLE (
     hs6_code text
 )
-LANGUAGE sql
+LANGUAGE plpgsql
 STABLE
 AS $$
-SELECT DISTINCT bt.hs6_code AS hs6_code
-FROM public.bilateral_trade bt
-WHERE bt.data_year = p_data_year
-  AND bt.hs6_code IS NOT NULL AND TRIM(bt.hs6_code) <> ''
-ORDER BY bt.hs6_code;
+BEGIN
+  PERFORM set_config('statement_timeout', '120000', true);
+  RETURN QUERY
+  SELECT DISTINCT bt.hs6_code AS hs6_code
+  FROM public.bilateral_trade bt
+  WHERE bt.data_year = p_data_year
+    AND bt.hs6_code IS NOT NULL AND TRIM(bt.hs6_code) <> ''
+  ORDER BY bt.hs6_code;
+END;
 $$;
 
 -- Distinct calendar years for BACI dropdowns: prefer tiny cache table bilateral_trade_data_years (see above).

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import html
+import inspect
 import json
+import os
 import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +45,7 @@ from utils.jodi_display import (
     jodi_columns_for_view,
     prepare_jodi_display_df,
 )
+from utils.postgrest_retry import execute_with_retries
 from utils.supabase_client import get_client, get_read_client
 
 PAGE_SIZE = 1000
@@ -338,6 +341,19 @@ def _rpc_fix_hint_markdown(err: str | None) -> str:
             "Or set **`SUPABASE_SERVICE_ROLE_KEY`** in `.env` for local Streamlit."
         )
     el = err.lower()
+    if (
+        "remoteprotocolerror" in el
+        or "server disconnected" in el
+        or "connection reset" in el
+        or "readerror" in el
+    ):
+        return (
+            "**HTTP connection dropped before a JSON error** — common when a **long `bilateral_trade` query** hits "
+            "a **statement** or **proxy** limit (you may not see `57014` in the UI). Re-apply **`schema/rpc_trade_dashboards.sql`** "
+            "(or **`20260420_rpc_trade_distinct_lists_plpgsql_timeout.sql`**) so distinct-list RPCs use **plpgsql** with "
+            "**120s** `statement_timeout`. Check Supabase **Logs** (Postgres + API); prefer **`SUPABASE_SERVICE_ROLE_KEY`** "
+            "for local Streamlit if the publishable key hits stricter pool limits."
+        )
     if "57014" in err or "statement timeout" in el or "canceling statement due to statement timeout" in el:
         return (
             "**Database statement timeout** (Postgres cancelled the query — often code `57014`). "
@@ -357,6 +373,27 @@ def _rpc_fix_hint_markdown(err: str | None) -> str:
         "If it is **timeout** / **57014**, apply **`20260416_rpc_trade_distinct_data_years_timeout_and_index.sql`** "
         "or full **`rpc_trade_dashboards.sql`**."
     )
+
+
+def _bilateral_distinct_rpc_allow_fallback() -> bool:
+    """Capped `bilateral_trade` scans are opt-in (dev / emergencies). Default: require RPC success."""
+    v = os.environ.get("BILATERAL_DISTINCT_RPC_ALLOW_FALLBACK", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _distinct_rpc_failed(rpc_label: str, exc: BaseException) -> RuntimeError:
+    return RuntimeError(
+        f"{rpc_label} failed after retries. {_rpc_error_hint(exc)} "
+        "Apply `schema/rpc_trade_dashboards.sql` (distinct-list plpgsql + 120s). Prefer "
+        "`SUPABASE_SERVICE_ROLE_KEY` in `.env` for local Streamlit. "
+        "Dev-only capped scans: set `BILATERAL_DISTINCT_RPC_ALLOW_FALLBACK=1`."
+    )
+
+
+def _show_distinct_rpc_failure(exc: RuntimeError) -> None:
+    root = exc.__cause__ if isinstance(exc.__cause__, BaseException) else exc
+    st.error(str(exc))
+    st.caption(_rpc_fix_hint_markdown(_rpc_error_hint(root)))
 
 
 @st.cache_resource
@@ -507,12 +544,12 @@ def rpc_trade_importer_supplier_metrics(
 @st.cache_data(ttl=3600, show_spinner=False)
 def rpc_trade_distinct_exporters() -> tuple[list[str], bool, str | None]:
     """
-    Prefer the DB RPC (complete list). If the RPC isn't deployed yet, fall back to a capped scan.
+    DB RPC only by default (complete list). Opt-in capped scan: BILATERAL_DISTINCT_RPC_ALLOW_FALLBACK=1.
     Returns (exporters, used_fallback_scan, rpc_error_detail_or_none).
     """
     sb = supabase()
     try:
-        res = sb.rpc("rpc_trade_distinct_exporters", {}).execute()
+        res = execute_with_retries(lambda: sb.rpc("rpc_trade_distinct_exporters", {}).execute())
         rows = res.data or []
         out: list[str] = []
         for r in rows:
@@ -521,32 +558,35 @@ def rpc_trade_distinct_exporters() -> tuple[list[str], bool, str | None]:
                 out.append(str(v).strip().upper())
         return sorted(set(out)), False, None
     except Exception as e:
-        # Fallback: capped scan (may miss exporters if table is huge).
-        exporters = bilateral_distinct_column_values(
-            "exporter",
-            (),
-            max_rows=BILATERAL_DISTINCT_SCAN_CAP,
-        )
-        normed: list[str] = []
-        for v in exporters:
-            if v is None or (isinstance(v, float) and pd.isna(v)):
-                continue
-            s = str(v).strip().upper()
-            if s:
-                normed.append(s)
-        return sorted(set(normed)), True, _rpc_error_hint(e)
+        if _bilateral_distinct_rpc_allow_fallback():
+            exporters = bilateral_distinct_column_values(
+                "exporter",
+                (),
+                max_rows=BILATERAL_DISTINCT_SCAN_CAP,
+            )
+            normed: list[str] = []
+            for v in exporters:
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    continue
+                s = str(v).strip().upper()
+                if s:
+                    normed.append(s)
+            return sorted(set(normed)), True, _rpc_error_hint(e)
+        raise _distinct_rpc_failed("rpc_trade_distinct_exporters", e) from e
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def rpc_trade_years_for_exporter(exporter_iso3: str) -> tuple[list[int], bool]:
     """
-    Prefer the DB RPC (complete list). If the RPC isn't deployed yet, fall back to a capped scan.
+    DB RPC only by default. Opt-in capped scan: BILATERAL_DISTINCT_RPC_ALLOW_FALLBACK=1.
     Returns (years, used_fallback_scan).
     """
     sb = supabase()
     exp = str(exporter_iso3).strip().upper()
     try:
-        res = sb.rpc("rpc_trade_years_for_exporter", {"exporter_iso3": exp}).execute()
+        res = execute_with_retries(
+            lambda: sb.rpc("rpc_trade_years_for_exporter", {"exporter_iso3": exp}).execute()
+        )
         rows = res.data or []
         out: list[int] = []
         for r in rows:
@@ -558,19 +598,21 @@ def rpc_trade_years_for_exporter(exporter_iso3: str) -> tuple[list[int], bool]:
             except (TypeError, ValueError):
                 continue
         return sorted(set(out)), False
-    except Exception:
-        years = bilateral_distinct_column_values(
-            "data_year",
-            (("exporter", exp),),
-            max_rows=BILATERAL_DISTINCT_SCAN_CAP,
-        )
-        out: list[int] = []
-        for y in years:
-            try:
-                out.append(int(y))
-            except (TypeError, ValueError):
-                continue
-        return sorted(set(out)), True
+    except Exception as e:
+        if _bilateral_distinct_rpc_allow_fallback():
+            years = bilateral_distinct_column_values(
+                "data_year",
+                (("exporter", exp),),
+                max_rows=BILATERAL_DISTINCT_SCAN_CAP,
+            )
+            out_fb: list[int] = []
+            for y in years:
+                try:
+                    out_fb.append(int(y))
+                except (TypeError, ValueError):
+                    continue
+            return sorted(set(out_fb)), True
+        raise _distinct_rpc_failed("rpc_trade_years_for_exporter", e) from e
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -595,12 +637,16 @@ def grpdep_common_years_and_latest(group_iso3: tuple[str, ...]) -> tuple[tuple[i
 @st.cache_data(ttl=3600, show_spinner=False)
 def rpc_trade_distinct_exporters_for_year(year: int) -> tuple[list[str], bool]:
     """
-    Prefer the DB RPC (complete list). If the RPC isn't deployed yet, fall back to a capped scan.
+    DB RPC only by default. Opt-in capped scan: BILATERAL_DISTINCT_RPC_ALLOW_FALLBACK=1.
     Returns (exporters, used_fallback_scan).
     """
     sb = supabase()
     try:
-        res = sb.rpc("rpc_trade_distinct_exporters_for_year", {"p_data_year": int(year)}).execute()
+        res = execute_with_retries(
+            lambda: sb.rpc(
+                "rpc_trade_distinct_exporters_for_year", {"p_data_year": int(year)}
+            ).execute()
+        )
         rows = res.data or []
         out: list[str] = []
         for r in rows:
@@ -608,22 +654,24 @@ def rpc_trade_distinct_exporters_for_year(year: int) -> tuple[list[str], bool]:
             if v is not None and str(v).strip():
                 out.append(str(v).strip().upper())
         return sorted(set(out)), False
-    except Exception:
-        exporters, truncated = bilateral_exporters_for_year(int(year), BILATERAL_DISTINCT_SCAN_CAP)
-        # If we hit the cap, that implies potential incompleteness.
-        return exporters, bool(truncated)
+    except Exception as e:
+        if _bilateral_distinct_rpc_allow_fallback():
+            exporters, truncated = bilateral_exporters_for_year(int(year), BILATERAL_DISTINCT_SCAN_CAP)
+            return exporters, bool(truncated)
+        raise _distinct_rpc_failed("rpc_trade_distinct_exporters_for_year", e) from e
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def rpc_trade_distinct_hs6_for_year(year: int) -> tuple[list[str], bool, str | None]:
     """
-    Prefer the DB RPC (complete distinct HS6 list for the year). If the RPC is not deployed yet,
-    fall back to a capped bilateral row scan (may miss codes).
+    DB RPC only by default. Opt-in capped scan: BILATERAL_DISTINCT_RPC_ALLOW_FALLBACK=1.
     Returns (hs6_codes, used_fallback_scan, rpc_error_detail_or_none).
     """
     sb = supabase()
     try:
-        res = sb.rpc("rpc_trade_distinct_hs6_for_year", {"p_data_year": int(year)}).execute()
+        res = execute_with_retries(
+            lambda: sb.rpc("rpc_trade_distinct_hs6_for_year", {"p_data_year": int(year)}).execute()
+        )
         rows = res.data or []
         out: list[str] = []
         for r in rows:
@@ -632,19 +680,21 @@ def rpc_trade_distinct_hs6_for_year(year: int) -> tuple[list[str], bool, str | N
                 out.append(str(v).strip())
         return sorted(set(out)), False, None
     except Exception as e:
-        codes, trunc = bilateral_hs6_codes_for_year(int(year), BILATERAL_DISTINCT_SCAN_CAP)
-        return codes, True, _rpc_error_hint(e)
+        if _bilateral_distinct_rpc_allow_fallback():
+            codes, trunc = bilateral_hs6_codes_for_year(int(year), BILATERAL_DISTINCT_SCAN_CAP)
+            return codes, True, _rpc_error_hint(e)
+        raise _distinct_rpc_failed("rpc_trade_distinct_hs6_for_year", e) from e
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def rpc_trade_distinct_data_years() -> tuple[list[int], bool, str | None]:
     """
-    Prefer the DB RPC (complete distinct `data_year` list). Fallback scans rows and may miss years.
+    DB RPC only by default. Opt-in capped scan: BILATERAL_DISTINCT_RPC_ALLOW_FALLBACK=1.
     Returns (years, used_fallback_scan, rpc_error_detail_or_none).
     """
     sb = supabase()
     try:
-        res = sb.rpc("rpc_trade_distinct_data_years", {}).execute()
+        res = execute_with_retries(lambda: sb.rpc("rpc_trade_distinct_data_years", {}).execute())
         rows = res.data or []
         out: list[int] = []
         for r in rows:
@@ -657,32 +707,36 @@ def rpc_trade_distinct_data_years() -> tuple[list[int], bool, str | None]:
                 continue
         return sorted(set(out)), False, None
     except Exception as e:
-        y_probe = bilateral_distinct_column_values(
-            "data_year",
-            (),
-            max_rows=BILATERAL_DISTINCT_SCAN_CAP,
-        )
-        out2: list[int] = []
-        for y in y_probe:
-            try:
-                out2.append(int(y))
-            except (TypeError, ValueError):
-                continue
-        return sorted(set(out2)), True, _rpc_error_hint(e)
+        if _bilateral_distinct_rpc_allow_fallback():
+            y_probe = bilateral_distinct_column_values(
+                "data_year",
+                (),
+                max_rows=BILATERAL_DISTINCT_SCAN_CAP,
+            )
+            out2: list[int] = []
+            for y in y_probe:
+                try:
+                    out2.append(int(y))
+                except (TypeError, ValueError):
+                    continue
+            return sorted(set(out2)), True, _rpc_error_hint(e)
+        raise _distinct_rpc_failed("rpc_trade_distinct_data_years", e) from e
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def rpc_trade_distinct_country_iso3_for_year(year: int) -> tuple[list[str], bool, str | None]:
     """
-    Prefer the DB RPC (distinct exporters ∪ importers for the year). Fallback: capped bilateral scan.
+    DB RPC only by default. Opt-in capped scan: BILATERAL_DISTINCT_RPC_ALLOW_FALLBACK=1.
     Returns (iso3_codes, used_fallback_scan, rpc_error_detail_or_none).
     """
     sb = supabase()
     try:
-        res = sb.rpc(
-            "rpc_trade_distinct_country_iso3_for_year",
-            {"p_data_year": int(year)},
-        ).execute()
+        res = execute_with_retries(
+            lambda: sb.rpc(
+                "rpc_trade_distinct_country_iso3_for_year",
+                {"p_data_year": int(year)},
+            ).execute()
+        )
         rows = res.data or []
         out: list[str] = []
         for r in rows:
@@ -691,8 +745,10 @@ def rpc_trade_distinct_country_iso3_for_year(year: int) -> tuple[list[str], bool
                 out.append(str(v).strip().upper())
         return sorted(set(out)), False, None
     except Exception as e:
-        countries, truncated = bilateral_country_codes_for_year(int(year), BILATERAL_DISTINCT_SCAN_CAP)
-        return countries, bool(truncated), _rpc_error_hint(e)
+        if _bilateral_distinct_rpc_allow_fallback():
+            countries, truncated = bilateral_country_codes_for_year(int(year), BILATERAL_DISTINCT_SCAN_CAP)
+            return countries, bool(truncated), _rpc_error_hint(e)
+        raise _distinct_rpc_failed("rpc_trade_distinct_country_iso3_for_year", e) from e
 
 
 @st.cache_data(ttl=300, show_spinner="Running trade RPC…")
@@ -2976,8 +3032,8 @@ def explore_gem_infrastructure_map() -> None:
     st.caption(
         "Loads **all rows** from each selected workbook sheet via **keyset pagination** on `id` (avoids slow `OFFSET` scans). "
         "Apply `schema/migrations/20260418_idx_gem_tracker_source_sheet_id.sql` on the database if loads still time out. "
-        "Cement, chemicals, iron/steel, and **LNG terminals** are **worldwide** — a **Middle East–only** map hides most of them; "
-        "leave **Filter by geographic area** off (default) or select every region. "
+        "Default view is **Middle East** only (rough lat/lon box). Cement, chemicals, iron/steel, and **LNG terminals** are **worldwide** — "
+        "turn **Filter by geographic area** off or add regions to see facilities outside the Middle East. "
         "Large sheets can take a while on first load; results are cached briefly. "
         "**Pipelines** often lack a single lat/long — those rows are skipped. Capacity sums are **best-effort** and **mix units**. "
         "**Colour** encodes facility category (distinct, colour-blind–friendly hues); **shade** varies slightly by detected **subtype** "
@@ -3010,17 +3066,17 @@ def explore_gem_infrastructure_map() -> None:
 
     apply_geo = st.checkbox(
         "Filter by geographic area",
-        value=False,
+        value=True,
         key="gem_map_apply_geo",
-        help="When off (default), every geocoded point is shown worldwide. When on, only points inside the selected rough regions (OR).",
+        help="When off, every geocoded point is shown worldwide. When on (default), only points inside the selected rough regions (OR).",
     )
     region_sel = st.multiselect(
         "Areas of interest",
         options=list(GEM_REGION_OPTIONS),
-        default=list(GEM_REGION_OPTIONS),
+        default=["Middle East"],
         key="gem_map_regions",
         disabled=not apply_geo,
-        help="Rough lat/lon boxes. Use all six to approximate worldwide; pick fewer (e.g. Middle East) to narrow.",
+        help="Rough lat/lon boxes. Default is Middle East; use all six to approximate worldwide.",
     )
     if apply_geo and not region_sel:
         st.info("Select at least one area, or turn off **Filter by geographic area** to show the whole world.")
@@ -3049,6 +3105,8 @@ def explore_gem_infrastructure_map() -> None:
         f"Loading **all rows** from **{len(to_load)}** sheet(s) in parallel (up to **{workers}** workers)…"
     )
 
+    regs = frozenset(region_sel) if apply_geo else frozenset()
+
     def _one(pair: tuple[str, str]) -> list[dict[str, Any]]:
         fn, sn = pair
         return _gem_fetch_pair_payloads_complete(fn, sn)
@@ -3073,16 +3131,32 @@ def explore_gem_infrastructure_map() -> None:
             hide_index=True,
         )
 
-    records, _sample = payloads_to_map_records_enriched(merged)
-    if not records:
+    if "geo_regions" in inspect.signature(payloads_to_map_records_enriched).parameters:
+        records, _sample, geo_by_cat = payloads_to_map_records_enriched(merged, geo_regions=regs)
+    else:
+        # Older `utils.gem_map_support` without geo_regions — filter after enrichment.
+        records, _sample = payloads_to_map_records_enriched(merged)  # type: ignore[misc]
+        geo_by_cat = Counter(str(r["category_label"]) for r in records)
+        if regs:
+            records = [
+                r
+                for r in records
+                if point_in_regions(float(r["lat"]), float(r["lon"]), regs)
+            ]
+    n_geocoded = int(sum(geo_by_cat.values()))
+    if n_geocoded == 0:
         st.info(
             "No latitude/longitude pairs found in the loaded rows. "
             "Pipeline line geometry is not parsed here; plant-heavy sheets should show points when coordinates exist."
         )
         return
+    if not records:
+        st.warning(
+            f"No points fall inside the selected area(s) (**{n_geocoded:,}** geocoded rows loaded). "
+            "Add regions or disable **Filter by geographic area**."
+        )
+        return
 
-    n_geocoded = len(records)
-    geo_by_cat = Counter(str(r["category_label"]) for r in records)
     with st.expander("Geocoded points by category (before area filter)", expanded=False):
         st.caption(
             "If raw rows exist but geocoded is **0**, coordinates may use unusual column names — check Explore more → GEM grid. "
@@ -3104,22 +3178,14 @@ def explore_gem_infrastructure_map() -> None:
             hide_index=True,
         )
 
-    regs = frozenset(region_sel) if apply_geo else frozenset()
-    records_view = [
-        r
-        for r in records
-        if point_in_regions(float(r["lat"]), float(r["lon"]), regs)
-    ]
-    if not records_view:
-        st.warning(
-            f"No points fall inside the selected area(s) (**{n_geocoded:,}** geocoded rows loaded). "
-            "Add regions or disable **Filter by geographic area**."
-        )
-        return
-
-    df_map = pd.DataFrame(records_view)
+    df_map = pd.DataFrame(records)
     mid_lat = float(df_map["lat"].median())
     mid_lon = float(df_map["lon"].median())
+    map_zoom = (
+        2.0
+        if not apply_geo or len(region_sel) >= len(GEM_REGION_OPTIONS)
+        else 4.0
+    )
 
     sum_rows: list[dict[str, Any]] = []
     for cat in sorted(df_map["category_label"].unique()):
@@ -3185,7 +3251,7 @@ def explore_gem_infrastructure_map() -> None:
         )
     deck = pdk.Deck(
         layers=layers,
-        initial_view_state=pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=2),
+        initial_view_state=pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=map_zoom),
         map_style=pdk.map_styles.CARTO_LIGHT,
         tooltip={
             "html": "{category_emoji} <b>{category_label}</b><br>{subtype_line}GEM id {gem_id}<br>{hover_html}",
@@ -3305,7 +3371,11 @@ def tab_who_trades() -> None:
         "to see every country in the loaded data. "
         "HS6 labels use **`hs_code_lookup`** — run `pull_comtrade_hs_lookup.py` if descriptions are missing."
     )
-    years, years_fb, years_err = rpc_trade_distinct_data_years()
+    try:
+        years, years_fb, years_err = rpc_trade_distinct_data_years()
+    except RuntimeError as e:
+        _show_distinct_rpc_failure(e)
+        return
     if years_fb:
         st.warning(
             "Year list uses a **fallback** (the `rpc_trade_distinct_data_years` RPC did not succeed). "
@@ -3319,7 +3389,11 @@ def tab_who_trades() -> None:
         st.info("No rows in `bilateral_trade`.")
         return
     year = st.selectbox("Year", years, index=len(years) - 1, key="trade_year")
-    hs_list, hs_fallback, hs_err = rpc_trade_distinct_hs6_for_year(int(year))
+    try:
+        hs_list, hs_fallback, hs_err = rpc_trade_distinct_hs6_for_year(int(year))
+    except RuntimeError as e:
+        _show_distinct_rpc_failure(e)
+        return
     if hs_fallback:
         st.warning(
             f"HS6 product list uses a **fallback row scan** (capped at **{BILATERAL_DISTINCT_SCAN_CAP:,}** rows for "
@@ -3501,7 +3575,11 @@ def tab_country_profile() -> None:
             d = r.get("description")
             if code and pd.notna(d):
                 desc_map[code] = str(d)
-    years, years_fb, years_err = rpc_trade_distinct_data_years()
+    try:
+        years, years_fb, years_err = rpc_trade_distinct_data_years()
+    except RuntimeError as e:
+        _show_distinct_rpc_failure(e)
+        return
     if years_fb:
         st.warning("Year list uses a **fallback** (`rpc_trade_distinct_data_years` RPC failed).")
         if years_err:
@@ -3512,7 +3590,11 @@ def tab_country_profile() -> None:
         st.info("No rows in `bilateral_trade`.")
         return
     year = st.selectbox("Year", years, index=len(years) - 1, key="prof_year")
-    countries, c_trunc, c_err = rpc_trade_distinct_country_iso3_for_year(int(year))
+    try:
+        countries, c_trunc, c_err = rpc_trade_distinct_country_iso3_for_year(int(year))
+    except RuntimeError as e:
+        _show_distinct_rpc_failure(e)
+        return
     if c_trunc:
         st.warning(
             f"Country list uses a **fallback row scan** (capped at **{BILATERAL_DISTINCT_SCAN_CAP:,}** rows for "
@@ -3703,7 +3785,11 @@ def tab_exporter_partners() -> None:
     refresh_lists = st.button("Refresh exporter/year lists", key="xpd_refresh_lists")
 
     if refresh_lists or "xpd_exporter_options" not in st.session_state:
-        all_exporters, exporters_fallback, exporters_rpc_err = rpc_trade_distinct_exporters()
+        try:
+            all_exporters, exporters_fallback, exporters_rpc_err = rpc_trade_distinct_exporters()
+        except RuntimeError as e:
+            _show_distinct_rpc_failure(e)
+            return
         if not all_exporters:
             st.info("No exporters found in `bilateral_trade`.")
             return
@@ -3750,7 +3836,11 @@ def tab_exporter_partners() -> None:
         st.session_state.get("xpd_years_fallback_by_exporter") or {}
     )
     if refresh_lists or exporter_iso not in years_by_exporter:
-        years_int, years_fallback = rpc_trade_years_for_exporter(exporter_iso)
+        try:
+            years_int, years_fallback = rpc_trade_years_for_exporter(exporter_iso)
+        except RuntimeError as e:
+            _show_distinct_rpc_failure(e)
+            return
         years_by_exporter[exporter_iso] = years_int
         years_fallback_by_exporter[exporter_iso] = bool(years_fallback)
         st.session_state["xpd_years_by_exporter"] = years_by_exporter
@@ -4120,13 +4210,16 @@ If e.g. SAU does not appear for HS6 710812, the filtered aggregate is empty for 
             """
         )
 
-    # Years + all-time exporter list: two cached RPCs; run in parallel on cold cache to cut first-paint latency.
-    with st.spinner("Loading year and country lists…"):
-        with ThreadPoolExecutor(max_workers=2) as _pool:
-            _f_y = _pool.submit(rpc_trade_distinct_data_years)
-            _f_e = _pool.submit(rpc_trade_distinct_exporters)
-            years_tup = _f_y.result()
-            exporters_seen, used_exporters_fallback, exporters_list_err = _f_e.result()
+    # Sequential RPCs: parallel calls ran off-thread (ScriptRunContext warnings) and doubled DB load,
+    # which contributed to PostgREST disconnects on heavy DISTINCT queries.
+    try:
+        with st.spinner("Loading year list…"):
+            years_tup = rpc_trade_distinct_data_years()
+        with st.spinner("Loading exporter list…"):
+            exporters_seen, used_exporters_fallback, exporters_list_err = rpc_trade_distinct_exporters()
+    except RuntimeError as e:
+        _show_distinct_rpc_failure(e)
+        return
     years, years_list_fallback, years_list_err = years_tup
     if not years:
         st.info("No rows in `bilateral_trade`.")
@@ -4141,14 +4234,12 @@ If e.g. SAU does not appear for HS6 710812, the filtered aggregate is empty for 
     c1, c2, c3, c4 = st.columns([2.2, 1.1, 1.5, 1.2])
     with c1:
         year = st.selectbox("Year", years, index=len(years) - 1, key="grpdep_year")
-    # Gulf ISO3s first (same order as Exporter & partners), then remaining exporters A–Z.
-    exporters_set = set(exporters_seen)
-    pinned = [g for g in GULF_EXPORTER_ISO3_ORDER if g in exporters_set]
-    tail = sorted(e for e in exporters_seen if e not in exporters_set)
-    exporter_options = pinned + tail
-    gulf_defaults = list(pinned)
-    if "grpdep_group" not in st.session_state and gulf_defaults:
-        st.session_state["grpdep_group"] = gulf_defaults
+    # Gulf ISO3s first (fixed order, all eight always listed), then remaining exporters A–Z.
+    gulf_iso3 = list(GULF_EXPORTER_ISO3_ORDER)
+    others = sorted(e for e in exporters_seen if e not in set(gulf_iso3))
+    exporter_options = gulf_iso3 + others
+    if "grpdep_group" not in st.session_state:
+        st.session_state["grpdep_group"] = list(gulf_iso3)
     if used_exporters_fallback:
         st.warning(
             (
@@ -4223,7 +4314,11 @@ If e.g. SAU does not appear for HS6 710812, the filtered aggregate is empty for 
         return
 
     group_key = tuple(sorted({str(x).strip().upper() for x in group if str(x).strip()}))
-    common_year_tuple, latest_common_year = grpdep_common_years_and_latest(group_key)
+    try:
+        common_year_tuple, latest_common_year = grpdep_common_years_and_latest(group_key)
+    except RuntimeError as e:
+        _show_distinct_rpc_failure(e)
+        return
     cc1, cc2 = st.columns([4.2, 1.1])
     with cc1:
         if latest_common_year is None:

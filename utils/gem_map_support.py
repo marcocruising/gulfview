@@ -6,11 +6,13 @@ import hashlib
 import html
 import math
 import re
+from collections import Counter
 from typing import Any
 
 import pandas as pd
 
 from utils.gem_facility_categories import style_for_source_sheet
+from utils.gem_regions import point_in_regions
 
 def _is_geo_column(nk: str) -> bool:
     if nk in ("latitude", "longitude", "lat", "lon", "lng", "long", "x", "y"):
@@ -403,14 +405,20 @@ def payloads_to_map_records_enriched(
     payload_key: str = "payload",
     source_file_key: str = "source_file",
     sheet_name_key: str = "sheet_name",
-) -> tuple[list[dict[str, Any]], list[str]]:
+    geo_regions: frozenset[str] = frozenset(),
+) -> tuple[list[dict[str, Any]], list[str], Counter[str]]:
     """
     Like `payloads_to_map_records` but adds `category_label`, `category_emoji`, `subtype_line` (HTML),
     `r`, `g`, `b`, `a` (subtype-shaded within category), optional `capacity_value` / `capacity_column`.
     Skips rows without coordinates.
+
+    When `geo_regions` is non-empty, rows whose (lat, lon) fall outside those rough regions are skipped
+    **before** hover/subtype/capacity work — large speedup for regional maps (e.g. Middle East only).
+    `geo_by_cat_all` still counts every geocoded row by category (worldwide), for UI summaries.
     """
     sample_keys: list[str] = []
     out: list[dict[str, Any]] = []
+    geo_by_cat_all: Counter[str] = Counter()
 
     for i, row in enumerate(rows):
         rid = row.get(id_key)
@@ -425,6 +433,12 @@ def payloads_to_map_records_enriched(
         if lat is None or lon is None:
             continue
 
+        label, rgba, emoji = style_for_source_sheet(sf, sn)
+        geo_by_cat_all[str(label)] += 1
+
+        if geo_regions and not point_in_regions(float(lat), float(lon), geo_regions):
+            continue
+
         h = build_hover_html(p if isinstance(p, dict) else {})
         if not h and isinstance(p, dict):
             h = "<br>".join(
@@ -432,7 +446,6 @@ def payloads_to_map_records_enriched(
                 for k, v in list(p.items())[:4]
             )
 
-        label, rgba, emoji = style_for_source_sheet(sf, sn)
         sub = extract_subtype(p if isinstance(p, dict) else None, sf, sn)
         rgba2 = _subtype_shade_rgba(rgba, sub)
         if sub:
@@ -464,7 +477,7 @@ def payloads_to_map_records_enriched(
             rec["capacity_column"] = cap_col
         out.append(rec)
 
-    return out, sample_keys
+    return out, sample_keys, geo_by_cat_all
 
 
 def map_records_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:

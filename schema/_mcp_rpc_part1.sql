@@ -5,6 +5,13 @@
 -- collide with table columns or RETURNS TABLE output names — avoids "ambiguous column
 -- reference" errors when PostgREST invokes these functions.
 
+CREATE TABLE IF NOT EXISTS public.bilateral_trade_data_years (
+    data_year integer NOT NULL PRIMARY KEY
+);
+
+GRANT SELECT ON public.bilateral_trade_data_years TO anon, authenticated, service_role;
+GRANT INSERT, DELETE, UPDATE ON public.bilateral_trade_data_years TO service_role;
+
 -- HS6 totals for an exporter and year (optional search by HS6 code substring or description).
 CREATE OR REPLACE FUNCTION public.rpc_trade_exporter_hs6_totals(
     exporter_iso3 text,
@@ -223,6 +230,88 @@ WHERE bt.data_year = p_data_year
 ORDER BY bt.exporter;
 $$;
 
+-- Distinct HS6 codes present in BACI for one year (complete list; avoids capped client row scans).
+CREATE OR REPLACE FUNCTION public.rpc_trade_distinct_hs6_for_year(p_data_year integer)
+RETURNS TABLE (
+    hs6_code text
+)
+LANGUAGE sql
+STABLE
+AS $$
+SELECT DISTINCT bt.hs6_code AS hs6_code
+FROM public.bilateral_trade bt
+WHERE bt.data_year = p_data_year
+  AND bt.hs6_code IS NOT NULL AND TRIM(bt.hs6_code) <> ''
+ORDER BY bt.hs6_code;
+$$;
+
+CREATE OR REPLACE FUNCTION public.rpc_trade_distinct_data_years()
+RETURNS TABLE (
+    data_year integer
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM public.bilateral_trade_data_years LIMIT 1) THEN
+    RETURN QUERY
+    SELECT y.data_year
+    FROM public.bilateral_trade_data_years y
+    ORDER BY 1;
+  ELSE
+    PERFORM set_config('statement_timeout', '120000', true);
+    RETURN QUERY
+    SELECT DISTINCT bt.data_year AS data_year
+    FROM public.bilateral_trade bt
+    ORDER BY 1;
+  END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.refresh_bilateral_trade_data_years_cache()
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  PERFORM set_config('statement_timeout', '120000', true);
+  TRUNCATE public.bilateral_trade_data_years;
+  INSERT INTO public.bilateral_trade_data_years (data_year)
+  SELECT DISTINCT bt.data_year
+  FROM public.bilateral_trade bt
+  ORDER BY 1;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.refresh_bilateral_trade_data_years_cache() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.refresh_bilateral_trade_data_years_cache() TO service_role;
+
+-- Distinct ISO3 codes appearing as exporter OR importer in a given year (Country profile, etc.).
+CREATE OR REPLACE FUNCTION public.rpc_trade_distinct_country_iso3_for_year(p_data_year integer)
+RETURNS TABLE (
+    country_iso3 text
+)
+LANGUAGE sql
+STABLE
+AS $$
+SELECT DISTINCT UPPER(TRIM(v)) AS country_iso3
+FROM (
+    SELECT bt.exporter AS v
+    FROM public.bilateral_trade bt
+    WHERE bt.data_year = p_data_year
+      AND bt.exporter IS NOT NULL
+      AND TRIM(bt.exporter) <> ''
+    UNION
+    SELECT bt.importer AS v
+    FROM public.bilateral_trade bt
+    WHERE bt.data_year = p_data_year
+      AND bt.importer IS NOT NULL
+      AND TRIM(bt.importer) <> ''
+) x(v)
+ORDER BY 1;
+$$;
+
 -- Available years for a given exporter (for exporter-first UI).
 CREATE OR REPLACE FUNCTION public.rpc_trade_years_for_exporter(exporter_iso3 text)
 RETURNS TABLE (
@@ -243,6 +332,7 @@ $$;
 
 -- Group share of world exports, by HS6, with within-group single-point-of-failure metrics.
 -- plpgsql + extended statement_timeout: full scans on bilateral_trade exceed PostgREST defaults.
+-- Ranking: group_export_usd_k DESC (total group exports per HS6), then group_share_pct, hs6_code — see rpc_trade_dashboards.sql.
 CREATE OR REPLACE FUNCTION public.rpc_trade_group_world_share_by_hs6(
     p_data_year integer,
     group_iso3 text[],
@@ -349,20 +439,40 @@ filt AS (
       OR TRIM(hs_query_text) = ''
       OR j.hs6_code ILIKE '%' || TRIM(hs_query_text) || '%'
       OR COALESCE(hl.description, '') ILIKE '%' || TRIM(hs_query_text) || '%'
+),
+hs6_ranked_by_group_export AS (
+    SELECT
+        f.hs6_code,
+        f.group_export_usd_k,
+        f.world_export_usd_k,
+        f.world_exporter_count,
+        f.group_share_pct,
+        f.top_group_exporter_iso3,
+        f.top_group_exporter_share_pct,
+        f.group_member_hhi,
+        f.group_exporter_count,
+        ROW_NUMBER() OVER (
+            ORDER BY
+                f.group_export_usd_k DESC NULLS LAST,
+                f.group_share_pct DESC NULLS LAST,
+                f.hs6_code ASC
+        ) AS rn_by_group_export_value
+    FROM filt f
 )
 SELECT
-    f.hs6_code,
-    f.group_export_usd_k,
-    f.world_export_usd_k,
-    f.world_exporter_count,
-    f.group_share_pct,
-    f.top_group_exporter_iso3,
-    f.top_group_exporter_share_pct,
-    f.group_member_hhi,
-    f.group_exporter_count
-FROM filt f
-ORDER BY f.group_share_pct DESC NULLS LAST, f.group_export_usd_k DESC NULLS LAST
-LIMIT GREATEST(1, LEAST(COALESCE(limit_n, 200), 2000));
+    r.hs6_code,
+    r.group_export_usd_k,
+    r.world_export_usd_k,
+    r.world_exporter_count,
+    r.group_share_pct,
+    r.top_group_exporter_iso3,
+    r.top_group_exporter_share_pct,
+    r.group_member_hhi,
+    r.group_exporter_count
+FROM hs6_ranked_by_group_export r
+WHERE r.rn_by_group_export_value
+      <= GREATEST(1, LEAST(COALESCE(limit_n, 200), 10000))
+ORDER BY r.rn_by_group_export_value;
 END;
 $$;
 
@@ -411,6 +521,67 @@ FROM agg a
 CROSS JOIN tot t
 WHERE a.export_usd_k > 0
 ORDER BY a.export_usd_k DESC NULLS LAST;
+END;
+$$;
+
+
+-- All selected group members' exports for a list of HS6 codes (same year).
+-- Use after rpc_trade_group_world_share_by_hs6: pass the same top-N hs6_code values to see every member × product.
+CREATE OR REPLACE FUNCTION public.rpc_trade_group_member_exports_for_hs6_list(
+    p_data_year integer,
+    group_iso3 text[],
+    p_hs6_codes text[]
+)
+RETURNS TABLE (
+    hs6_code text,
+    exporter_iso3 text,
+    export_usd_k numeric,
+    share_of_group_product_pct numeric
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+  PERFORM set_config('statement_timeout', '120000', true);
+  RETURN QUERY
+  WITH grp AS (
+    SELECT DISTINCT UPPER(TRIM(x)) AS iso3
+    FROM unnest(COALESCE(group_iso3, ARRAY[]::text[])) AS x
+    WHERE TRIM(COALESCE(x, '')) <> ''
+  ),
+  codes AS (
+    SELECT DISTINCT UPPER(TRIM(c)) AS hs6
+    FROM unnest(COALESCE(p_hs6_codes, ARRAY[]::text[])) AS c
+    WHERE TRIM(COALESCE(c, '')) <> ''
+  ),
+  agg AS (
+    SELECT
+        bt.hs6_code AS hs6_code,
+        bt.exporter AS exporter_iso3,
+        SUM(COALESCE(bt.trade_value_usd, 0)) AS export_usd_k
+    FROM public.bilateral_trade bt
+    JOIN grp g ON g.iso3 = UPPER(TRIM(bt.exporter))
+    INNER JOIN codes co ON co.hs6 = UPPER(TRIM(bt.hs6_code))
+    WHERE bt.data_year = p_data_year
+    GROUP BY bt.hs6_code, bt.exporter
+    HAVING SUM(COALESCE(bt.trade_value_usd, 0)) > 0
+  ),
+  tot AS (
+    SELECT a.hs6_code, SUM(a.export_usd_k) AS group_product_total
+    FROM agg a
+    GROUP BY a.hs6_code
+  )
+  SELECT
+    a.hs6_code,
+    a.exporter_iso3,
+    a.export_usd_k,
+    CASE
+      WHEN t.group_product_total > 0 THEN (a.export_usd_k / t.group_product_total) * 100
+      ELSE 0::numeric
+    END AS share_of_group_product_pct
+  FROM agg a
+  JOIN tot t ON t.hs6_code = a.hs6_code
+  ORDER BY a.hs6_code, a.export_usd_k DESC NULLS LAST;
 END;
 $$;
 

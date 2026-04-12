@@ -128,7 +128,7 @@ Apply [schema/create_tables.sql](schema/create_tables.sql) once to your Supabase
 psql "$DATABASE_URL" -f schema/create_tables.sql
 ```
 
-Apply trade dashboard RPCs used by Streamlit (safe to re-run; creates/replaces SQL functions + supporting indexes). This file includes **Exporter & partners** aggregates, **`rpc_trade_distinct_exporters_for_year`** (full exporter list per year), and **Group dependencies** RPCs; heavy group-share functions run as `plpgsql` with an extended **`statement_timeout`** (120s) to reduce PostgREST timeouts on large `bilateral_trade` scans.
+Apply trade dashboard RPCs used by Streamlit (safe to re-run; creates/replaces SQL functions + supporting indexes). This file includes **Exporter & partners** aggregates; **distinct lists** on `bilateral_trade` (**`rpc_trade_distinct_exporters`**, **`rpc_trade_distinct_exporters_for_year`**, **`rpc_trade_distinct_hs6_for_year`**, **`rpc_trade_distinct_data_years`**, **`rpc_trade_distinct_country_iso3_for_year`**) so dropdowns are complete without capped client scans; and **Group dependencies** RPCs. The file ends with **`GRANT EXECUTE`** on all `public.rpc_trade%` functions for **`anon`**, **`authenticated`**, and **`service_role`** so PostgREST calls from the **publishable** key succeed (without this, the app falls back to capped scans). Heavy group-share functions run as `plpgsql` with an extended **`statement_timeout`** (120s) to reduce PostgREST timeouts on large `bilateral_trade` scans.
 ```bash
 # Option A: Supabase Dashboard → SQL Editor → run the file
 # Option B: psql
@@ -651,11 +651,13 @@ uv run python loaders/load_baci.py --year 2022
 # Load all CSV files found in data/baci/
 uv run python loaders/load_baci.py --all
 
-# Optional: all HS6 lines for one exporter (e.g. ARE) — Streamlit tab “Exporter & partners”
+# Optional: all HS6 lines for one or more exporters — Streamlit “Exporter & partners” / fair multi-country groups
 uv run python loaders/load_baci.py --all --exporter-full-hs ARE
+# Repeat the flag so every country in a Gulf (or other) group has the same HS6 coverage:
+# uv run python loaders/load_baci.py --all --exporter-full-hs SAU --exporter-full-hs ARE --exporter-full-hs IRQ ...
 
 # Optional: repeat --importer-full-hs for each partner ISO3 so the app can show full supplier
-# concentration (every exporter → that importer × HS6). Combine with the line above as needed.
+# concentration (every exporter → that importer × HS6). Combine with the lines above as needed.
 uv run python loaders/load_baci.py --all --exporter-full-hs ARE --importer-full-hs IND
 
 # Optional: load global BACI flows for specific HS6 codes (all exporters × all importers)
@@ -667,7 +669,7 @@ uv run python loaders/load_baci.py --year 2024 --hs6-codes "270900,851713"
 
 The loader filters to only the HS codes in scope (defined at the top of the script) so it does
 not try to load all 5,000 products. This keeps DB size manageable and load time fast.
-**`--exporter-full-hs`** and **`--importer-full-hs`** *add* rows outside that list for the given ISO3 legs (other flows stay V1-filtered).
+**`--exporter-full-hs`** (repeat once per exporter) and **`--importer-full-hs`** *add* rows outside that list for the given ISO3 legs (other flows stay V1-filtered). Using full-HS for **one** country only makes that country dominate multi-country **Group dependencies** for HS6 outside the V1 list — repeat **`--exporter-full-hs`** for every group member you care about, or use **`--hs6-codes`** for the products you analyze.
 **`--hs6-codes`** / **`--hs6-codes-file`** *add* rows for those six-digit HS6 codes globally (all partner legs), which is what makes “% of world exports” meaningful for selected products.
 
 **Known limitation:** Annual only, no monthly granularity. Use Comtrade API (future v2)
@@ -749,6 +751,8 @@ uv run python loaders/load_usgs.py facilities   # myb3-*.xlsx → usgs_myb3_prod
 ```
 
 **myb3 xlsx (`facilities`):** Ingests all matching workbooks under `data/usgs/`. Semantics and edge cases: [HANDOVER.md](HANDOVER.md) **USGS myb3 yearbooks**. Schema: [`schema/create_tables.sql`](schema/create_tables.sql); catalog: [`schema/seed_table_catalog.sql`](schema/seed_table_catalog.sql). After changing the parser, run **`uv run python scripts/validate_myb3_table2.py`** (ditto expansion in O/L/C, commodity `Do.` replay, **`commodity_cell_raw`** matches **`commodity_leaf_resolved`** on ditto rows, idempotent re-parse).
+
+**Table 2 facility geocoding (optional, for map coordinates):** Apply migration [`schema/migrations/20260419_usgs_facilities_geocode_columns.sql`](schema/migrations/20260419_usgs_facilities_geocode_columns.sql), then run **`uv run python scripts/geocode_usgs_facilities.py`**. The script queries **OpenStreetMap Nominatim** (public instance: ~1 request per second; set **`NOMINATIM_USER_AGENT`** to a contact string). It fills **`geocode_lat`**, **`geocode_lon`**, **`geocode_query`**, **`geocode_source`**, and **`geocoded_at`** on **`usgs_country_mineral_facilities`**. The Explore more USGS **Yearbook Table 2** map prefers these coordinates; follow OSM/Nominatim attribution in the app.
 
 ### `load_gem_xlsx.py` — Global Energy Monitor (default bundle)
 

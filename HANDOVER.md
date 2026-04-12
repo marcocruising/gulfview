@@ -32,7 +32,7 @@ This note is for the next agent or developer picking up the repo. The canonical 
 
 | Script | Tables |
 |--------|--------|
-| [load_baci.py](loaders/load_baci.py) | `bilateral_trade` — base HS filter in script; optional **`--exporter-full-hs`** / **`--importer-full-hs`** for full legs; **`--hs6-codes`** / **`--hs6-codes-file`** for **global** flows (all partners) for listed HS6 (needed for credible “world share” in **Group dependencies**) |
+| [load_baci.py](loaders/load_baci.py) | `bilateral_trade` — base HS filter in script; optional **`--exporter-full-hs`** (repeat per ISO3) / **`--importer-full-hs`** for full legs; **`--hs6-codes`** / **`--hs6-codes-file`** for **global** flows (all partners) for listed HS6 (needed for credible “world share” and **fair multi-member** **Group dependencies**) |
 | [load_cepi_beyond_baci.py](loaders/load_cepi_beyond_baci.py) | `cepii_protee_hs6`, `cepii_geodep_import_dependence` |
 | [load_jodi.py](loaders/load_jodi.py) | `jodi_energy_observations` |
 | [load_usgs.py](loaders/load_usgs.py) | `usgs_mineral_statistics` (`mcs`); `usgs_myb3_production` + `usgs_country_mineral_facilities` (`facilities` / `myb3*.xlsx`) |

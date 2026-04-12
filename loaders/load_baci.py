@@ -3,20 +3,17 @@
 # SOURCE:  CEPII BACI bilateral trade
 # URL:     http://www.cepii.fr/CEPII/en/bdd_modele/bdd_modele_item.asp?id=37
 # API KEY: not required (manual CSV download)
-# WRITES:  bilateral_trade
+# WRITES:  bilateral_trade, bilateral_trade_data_years (year cache for RPC dropdowns)
 # REFRESH: annual
 # NOTES:   Place BACI_HS*_Y*.csv files under data/baci/
-#          Optional --exporter-full-hs / --importer-full-hs load all HS6 for those
-#          legs so the app can show full supplier concentration (importer × HS6).
+#          Optional --exporter-full-hs (repeat per country) / --importer-full-hs load all HS6
+#          for those legs so the app can show full supplier concentration (importer × HS6).
 # ============================================================
 
 # --- CONFIGURATION — edit these values before running --------
 YEARS = [2020, 2021, 2022, 2023, 2024]
-HS_CODES = [
-    "2709", "2711", "2710", "2814", "3102", "3103", "3104", "3105",
-    "1001", "1006", "1005", "1201", "5201",
-]
-COUNTRIES = None
+# HS chapter / prefix allowlist (e.g. "2709", "1001"). Empty = include every HS6 in the BACI file (very large).
+HS_CODES: list[str] = []
 # -------------------------------------------------------------
 
 import argparse
@@ -62,15 +59,22 @@ def _hs_allowed(hs6: str) -> bool:
     if not s:
         return False
     s6 = s.zfill(6)[:6]
+    if len(s6) != 6 or not s6.isdigit():
+        return False
     if HS6_ALLOWLIST and s6 in HS6_ALLOWLIST:
+        return True
+    if not HS_CODES:
+        # No chapter filter: all HS6, unless CLI set --hs6-codes only (then only allowlist matches above).
+        if HS6_ALLOWLIST:
+            return False
         return True
     for h in HS_CODES:
         h = str(h).strip()
         if len(h) == 6:
-            if s == h or s.startswith(h):
+            if s6 == h or s6.startswith(h):
                 return True
         else:
-            if s.startswith(h):
+            if s6.startswith(h):
                 return True
     return False
 
@@ -105,17 +109,17 @@ def _norm_iso3(token: str) -> str | None:
 def _include_row_mask(
     df: pd.DataFrame,
     *,
-    exporter_full_hs: str | None,
+    exporters_full_hs: frozenset[str],
     importers_full_hs: frozenset[str],
 ) -> pd.Series:
-    """True if row should be loaded: V1 HS filter OR full-HS exporter/importer match."""
+    """True if row should be loaded: HS filter (or all HS6 if HS_CODES empty) OR full-HS exporter/importer match."""
     exp = df["i"].map(_baci_numeric_to_iso3)
     imp = df["j"].map(_baci_numeric_to_iso3)
     k = df["k"].astype(str)
     hs_ok = k.map(_hs_allowed)
     m = hs_ok
-    if exporter_full_hs:
-        m = m | (exp == exporter_full_hs)
+    if exporters_full_hs:
+        m = m | exp.isin(exporters_full_hs)
     if importers_full_hs:
         m = m | imp.isin(set(importers_full_hs))
     return m
@@ -137,9 +141,12 @@ def main() -> int:
     )
     ap.add_argument(
         "--exporter-full-hs",
+        action="append",
+        default=[],
         metavar="ISO3",
-        default=None,
-        help="Also load all HS6 lines where exporter is this ISO3 (e.g. ARE for full UAE exports).",
+        dest="exporter_full_hs_list",
+        help="Also load all HS6 lines where exporter is this ISO3. Repeat for each country "
+        "(e.g. Gulf group analysis: pass once per member). Same as legacy single use.",
     )
     ap.add_argument(
         "--importer-full-hs",
@@ -182,10 +189,14 @@ def main() -> int:
             print(f"Failed reading --hs6-codes-file: {e}", file=sys.stderr)
             return 1
 
-    exporter_full = _norm_iso3(args.exporter_full_hs) if args.exporter_full_hs else None
-    if args.exporter_full_hs and exporter_full is None:
-        print(f"Invalid --exporter-full-hs (need 3-letter ISO3): {args.exporter_full_hs!r}", file=sys.stderr)
-        return 1
+    exporters_full: set[str] = set()
+    for raw in args.exporter_full_hs_list or []:
+        iso = _norm_iso3(str(raw))
+        if not iso:
+            print(f"Invalid --exporter-full-hs (need 3-letter ISO3): {raw!r}", file=sys.stderr)
+            return 1
+        exporters_full.add(iso)
+    exporters_full_hs = frozenset(exporters_full)
     imp_set: set[str] = set()
     for raw in args.importer_full_hs or []:
         iso = _norm_iso3(raw)
@@ -207,7 +218,7 @@ def main() -> int:
         "hs6_allowlist": sorted(HS6_ALLOWLIST),
         "year_arg": args.year,
         "all": args.all,
-        "exporter_full_hs": exporter_full,
+        "exporter_full_hs": sorted(exporters_full),
         "importer_full_hs": sorted(imp_set),
     }
     try:
@@ -230,6 +241,7 @@ def main() -> int:
         pulled_at = datetime.now(timezone.utc).isoformat()
         files_used: list[str] = []
         rows_written = 0
+        years_touched: set[int] = set()
 
         for path in paths:
             data_year = _year_from_filename(path)
@@ -255,7 +267,7 @@ def main() -> int:
             files_used.append(path.name)
             mask = _include_row_mask(
                 df,
-                exporter_full_hs=exporter_full,
+                exporters_full_hs=exporters_full_hs,
                 importers_full_hs=importers_full_hs,
             )
             sub = df.loc[mask, :].copy()
@@ -297,12 +309,19 @@ def main() -> int:
                     batch, on_conflict="exporter,importer,hs6_code,data_year"
                 ).execute()
             rows_written += len(records)
+            years_touched.add(int(data_year))
 
         if rows_written <= 0:
             msg = "No rows after HS/year filters (check YEARS and HS_CODES / HS6 allowlist vs file contents)."
             finish_run(client, run_id, 0, "partial", msg)
             print(msg, file=sys.stderr)
             return 0
+
+        for y in sorted(years_touched):
+            client.table("bilateral_trade_data_years").upsert(
+                [{"data_year": y}],
+                on_conflict="data_year",
+            ).execute()
 
         finish_run(client, run_id, int(rows_written), "success", None)
         print(f"Loaded {rows_written} rows from {len(files_used)} file(s).")

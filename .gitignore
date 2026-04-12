@@ -1,4 +1,5 @@
 .env
+.streamlit/credentials.toml
 .venv/
 venv/
 __pycache__/

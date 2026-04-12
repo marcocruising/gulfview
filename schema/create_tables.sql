@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS bilateral_trade (
 
 CREATE INDEX IF NOT EXISTS idx_bilateral_trade_exporter_data_year ON bilateral_trade (exporter, data_year);
 CREATE INDEX IF NOT EXISTS idx_bilateral_trade_importer_hs6_year ON bilateral_trade (importer, hs6_code, data_year);
+CREATE INDEX IF NOT EXISTS idx_bilateral_trade_data_year ON bilateral_trade (data_year);
+
+-- Calendar years present in bilateral_trade (cache for rpc_trade_distinct_data_years; loaders/load_baci.py maintains).
+CREATE TABLE IF NOT EXISTS bilateral_trade_data_years (
+    data_year integer NOT NULL PRIMARY KEY
+);
+GRANT SELECT ON bilateral_trade_data_years TO anon, authenticated, service_role;
+GRANT INSERT, DELETE, UPDATE ON bilateral_trade_data_years TO service_role;
 
 -- Persisted trade dependency snapshots (computed aggregates to avoid recomputation in the UI).
 CREATE TABLE IF NOT EXISTS trade_group_dependency_snapshots (
@@ -333,7 +341,12 @@ CREATE TABLE IF NOT EXISTS usgs_country_mineral_facilities (
     excel_row_end           INTEGER NOT NULL,
     source_file             TEXT NOT NULL,
     source                  TEXT NOT NULL,
-    pulled_at               TIMESTAMPTZ NOT NULL
+    pulled_at               TIMESTAMPTZ NOT NULL,
+    geocode_lat             DOUBLE PRECISION,
+    geocode_lon             DOUBLE PRECISION,
+    geocode_query           TEXT,
+    geocode_source          TEXT,
+    geocoded_at             TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_usgs_facilities_country_ref
@@ -356,6 +369,10 @@ CREATE TABLE IF NOT EXISTS gem_tracker_rows (
 
 CREATE INDEX IF NOT EXISTS idx_gem_tracker_source_sheet
     ON gem_tracker_rows (source_file, sheet_name);
+
+-- Keyset pagination (WHERE source_file AND sheet_name AND id > $n ORDER BY id) for full-sheet GEM loads.
+CREATE INDEX IF NOT EXISTS idx_gem_tracker_source_sheet_id
+    ON gem_tracker_rows (source_file, sheet_name, id);
 
 CREATE INDEX IF NOT EXISTS idx_gem_tracker_payload_gin
     ON gem_tracker_rows USING GIN (payload);
@@ -426,6 +443,16 @@ INSERT INTO table_catalog (
     'reporter, flow_type, product, data_year, data_month',
     'pullers/pull_eia.py',
     20
+),
+(
+    'public',
+    'bilateral_trade_data_years',
+    'BACI years index (cache)',
+    'One row per calendar year that appears in bilateral_trade. Used by rpc_trade_distinct_data_years for fast year dropdowns; loaders/load_baci.py upserts after each successful load. Call refresh_bilateral_trade_data_years_cache() to rebuild if rows were deleted.',
+    'One row per data_year.',
+    'data_year',
+    'loaders/load_baci.py; optional refresh_bilateral_trade_data_years_cache() in SQL',
+    25
 ),
 (
     'public',

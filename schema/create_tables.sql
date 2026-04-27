@@ -1,6 +1,8 @@
 -- Hormuz supply chain — full schema for Supabase (run once in SQL Editor or psql)
 -- Upsert-friendly UNIQUE constraints match pullers/loaders on_conflict targets.
 
+CREATE EXTENSION IF NOT EXISTS postgis;
+
 -- Human-readable reference for every application table (not Postgres system catalogs).
 CREATE TABLE IF NOT EXISTS table_catalog (
     id              SERIAL PRIMARY KEY,
@@ -379,11 +381,93 @@ CREATE INDEX IF NOT EXISTS idx_gem_tracker_payload_gin
 
 ALTER TABLE gem_tracker_rows DISABLE ROW LEVEL SECURITY;
 
+-- Undersea internet cables — TeleGeography Submarine Cable Map (CC BY-NC-SA 3.0).
+CREATE TABLE IF NOT EXISTS subsea_landing_points (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    is_tbd      BOOLEAN NOT NULL DEFAULT FALSE,
+    lon         DOUBLE PRECISION NOT NULL,
+    lat         DOUBLE PRECISION NOT NULL,
+    geom        geometry(Point, 4326),
+    source      TEXT NOT NULL,
+    source_url  TEXT NOT NULL,
+    license     TEXT NOT NULL,
+    pulled_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_subsea_landing_points_name
+    ON subsea_landing_points (name);
+CREATE INDEX IF NOT EXISTS idx_subsea_landing_points_geom
+    ON subsea_landing_points USING GIST (geom);
+ALTER TABLE subsea_landing_points DISABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS subsea_cable_systems (
+    slug        TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    rfs_year    INTEGER,
+    length_km   NUMERIC,
+    owners      TEXT,
+    website     TEXT,
+    source      TEXT NOT NULL,
+    source_url  TEXT NOT NULL,
+    license     TEXT NOT NULL,
+    pulled_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_subsea_cable_systems_name
+    ON subsea_cable_systems (name);
+ALTER TABLE subsea_cable_systems DISABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS subsea_cable_routes (
+    id          BIGSERIAL PRIMARY KEY,
+    cable_slug  TEXT NOT NULL REFERENCES subsea_cable_systems(slug) ON DELETE CASCADE,
+    color       TEXT,
+    path_coords JSONB NOT NULL,
+    geom        geometry(MultiLineString, 4326),
+    source      TEXT NOT NULL,
+    source_url  TEXT NOT NULL,
+    license     TEXT NOT NULL,
+    pulled_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (cable_slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_subsea_cable_routes_slug
+    ON subsea_cable_routes (cable_slug);
+CREATE INDEX IF NOT EXISTS idx_subsea_cable_routes_path_coords_gin
+    ON subsea_cable_routes USING GIN (path_coords);
+CREATE INDEX IF NOT EXISTS idx_subsea_cable_routes_geom
+    ON subsea_cable_routes USING GIST (geom);
+ALTER TABLE subsea_cable_routes DISABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS subsea_cable_landing_points (
+    cable_slug          TEXT NOT NULL REFERENCES subsea_cable_systems(slug) ON DELETE CASCADE,
+    landing_point_id    TEXT NOT NULL REFERENCES subsea_landing_points(id) ON DELETE CASCADE,
+    ordinal             INTEGER,
+    pulled_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (cable_slug, landing_point_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_subsea_cable_landing_points_lp
+    ON subsea_cable_landing_points (landing_point_id);
+ALTER TABLE subsea_cable_landing_points DISABLE ROW LEVEL SECURITY;
+
 ALTER TABLE trade_group_dependency_snapshots DISABLE ROW LEVEL SECURITY;
 ALTER TABLE trade_group_dependency_rows DISABLE ROW LEVEL SECURITY;
 
 CREATE INDEX IF NOT EXISTS idx_cepii_geodep_country_year
     ON cepii_geodep_import_dependence (country, data_year);
+
+GRANT SELECT ON subsea_landing_points TO anon, authenticated, service_role;
+GRANT SELECT ON subsea_cable_systems TO anon, authenticated, service_role;
+GRANT SELECT ON subsea_cable_routes TO anon, authenticated, service_role;
+GRANT SELECT ON subsea_cable_landing_points TO anon, authenticated, service_role;
+
+GRANT INSERT, UPDATE, DELETE ON subsea_landing_points TO service_role;
+GRANT INSERT, UPDATE, DELETE ON subsea_cable_systems TO service_role;
+GRANT INSERT, UPDATE, DELETE ON subsea_cable_routes TO service_role;
+GRANT INSERT, UPDATE, DELETE ON subsea_cable_landing_points TO service_role;
+
+GRANT USAGE, SELECT ON SEQUENCE subsea_cable_routes_id_seq TO service_role;
 
 CREATE INDEX IF NOT EXISTS idx_cepii_geodep_hs6_year
     ON cepii_geodep_import_dependence (hs6_code, data_year);
@@ -623,6 +707,46 @@ INSERT INTO table_catalog (
     'source_file, sheet_name, excel_row_1based',
     'loaders/load_gem_xlsx.py',
     145
+),
+(
+    'public',
+    'subsea_landing_points',
+    'Undersea cable landing points',
+    'TeleGeography Submarine Cable Map landing points as WGS84 points (lon/lat). Includes attribution fields and is_tbd flag from source.',
+    'One row per landing point (TeleGeography id).',
+    'id',
+    'loaders/load_subsea_cables.py',
+    150
+),
+(
+    'public',
+    'subsea_cable_systems',
+    'Undersea cable systems (metadata)',
+    'TeleGeography Submarine Cable Map cable systems metadata (name, RFS year, length, owners, website) keyed by slug.',
+    'One row per cable system (slug).',
+    'slug',
+    'loaders/load_subsea_cables.py',
+    155
+),
+(
+    'public',
+    'subsea_cable_routes',
+    'Undersea cable routes (geometry)',
+    'TeleGeography Submarine Cable Map cable routes as MultiLineStrings stored as JSON coordinates (plus optional PostGIS geometry) for fast map rendering in the app.',
+    'One row per cable system (slug) with a list of line strings.',
+    'cable_slug',
+    'loaders/load_subsea_cables.py',
+    160
+),
+(
+    'public',
+    'subsea_cable_landing_points',
+    'Undersea cable ↔ landing point links',
+    'Many-to-many relationship between cable systems and landing points from TeleGeography. Supports future filtering (e.g. show cables that land in a country).',
+    'One row per cable_slug × landing_point_id pair.',
+    'cable_slug, landing_point_id',
+    'loaders/load_subsea_cables.py',
+    165
 )
 ON CONFLICT (table_schema, table_name) DO UPDATE SET
     title = EXCLUDED.title,

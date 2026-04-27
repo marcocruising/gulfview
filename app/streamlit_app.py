@@ -57,15 +57,15 @@ BILATERAL_DISTINCT_SCAN_CAP = 120_000
 # Sidebar navigation: Streamlit `st.tabs` runs *every* tab’s code on each rerun (any widget anywhere),
 # which reloads the whole app. We render one section at a time.
 _APP_SECTIONS: tuple[str, ...] = (
-    "Prices over time",
-    "Who trades what",
-    "Country profile",
-    "Exporter & partners",
-    "Group dependencies",
-    "Crop production",
-    "Pipeline status",
-    "GEM infrastructure map",
-    "Explore more",
+    "Commodity prices (time series)",
+    "Trade by product (top countries)",
+    "Country trade profile",
+    "Exporters: partners & products",
+    "Group export exposure",
+    "Crop production (by country)",
+    "Data refresh status",
+    "Infrastructure map (GEM assets)",
+    "Data library (all tables)",
 )
 BILATERAL_EXPORT_DRILLDOWN_CAP = 500_000
 # Country profile: max bilateral rows to load for one country × year (same order of magnitude as HS6 slice).
@@ -3040,6 +3040,240 @@ def explore_gem_infrastructure_map() -> None:
         "(from payload columns). **Emoji** in the category picker and tooltips match each category — markers stay as dots for performance."
     )
 
+    @st.cache_data(ttl=300, show_spinner="Loading GEM pipeline line geometry (Supabase)…")
+    def _load_gem_pipeline_paths_supabase(
+        regs: frozenset[str],
+        apply_geo: bool,
+        dataset: str | None,
+    ) -> dict[str, Any]:
+        """
+        Fetch pipeline line geometry from Supabase (PostGIS) via bbox RPC.
+
+        Returns:
+          - rows: list of dicts for a PyDeck PathLayer
+          - meta: diagnostics (row counts, bbox, dataset)
+        """
+        import json
+        from collections import Counter
+
+        # Build one big bbox covering selected regions (OR). Fast + good enough for rough region filters.
+        if not apply_geo or not regs:
+            bbox = (-180.0, -90.0, 180.0, 90.0)
+        else:
+            # Mirror utils.gem_regions: list of (lat_min, lat_max, lon_min, lon_max)
+            from utils.gem_regions import _GEM_REGION_BBOXES  # type: ignore[attr-defined]
+
+            lon_min = 180.0
+            lon_max = -180.0
+            lat_min = 90.0
+            lat_max = -90.0
+            for name in regs:
+                for la0, la1, lo0, lo1 in _GEM_REGION_BBOXES.get(name, []):
+                    lat_min = min(lat_min, float(la0))
+                    lat_max = max(lat_max, float(la1))
+                    lon_min = min(lon_min, float(lo0))
+                    lon_max = max(lon_max, float(lo1))
+            bbox = (lon_min, lat_min, lon_max, lat_max)
+
+        # Use the same client strategy as the rest of the app:
+        # prefer service role if present (local dev), else fall back to publishable/anon.
+        sb = _client()
+        res = execute_with_retries(
+            lambda: sb.rpc(
+                "rpc_gem_pipeline_segments_bbox",
+                {
+                    "p_min_lon": float(bbox[0]),
+                    "p_min_lat": float(bbox[1]),
+                    "p_max_lon": float(bbox[2]),
+                    "p_max_lat": float(bbox[3]),
+                    "p_dataset": dataset,
+                },
+            ).execute()
+        )
+        raw = list(res.data or [])
+
+        geom_type_counts: Counter[str] = Counter()
+        rows: list[dict[str, Any]] = []
+        skipped_bad_geojson = 0
+
+        def _to_hover(props: dict[str, Any], fuel_label: str, name_fallback: str, status_fallback: str) -> str:
+            pid = props.get("ProjectID") or props.get("project_id") or ""
+            name = props.get("PipelineName") or props.get("pipeline_name") or name_fallback or ""
+            seg = props.get("SegmentName") or props.get("segment_name") or ""
+            status = props.get("Status") or props.get("status") or status_fallback or ""
+            cap = props.get("Capacity") or props.get("capacity")
+            cap_units = props.get("CapacityUnits") or props.get("capacity_units") or ""
+            start = props.get("StartLocation") or props.get("start_location") or ""
+            end = props.get("EndLocation") or props.get("end_location") or ""
+            hover_bits = [
+                f"<b>{name}</b>" if name else "",
+                f"{seg}" if seg and seg != name else "",
+                f"{fuel_label}",
+                f"Status: {status}" if status else "",
+                f"Capacity: {cap} {cap_units}".strip() if cap not in (None, "") else "",
+                f"{start} → {end}".strip(" →") if start or end else "",
+                f"GEM id {pid}" if pid else "",
+            ]
+            return "<br>".join([x for x in hover_bits if x])
+
+        for r in raw:
+            gj = r.get("geom_geojson_text")
+            if not gj:
+                skipped_bad_geojson += 1
+                continue
+            try:
+                g = json.loads(gj)
+            except Exception:
+                skipped_bad_geojson += 1
+                continue
+            gtype = (g or {}).get("type")
+            coords = (g or {}).get("coordinates")
+            geom_type_counts[str(gtype)] += 1
+            props = r.get("properties") or {}
+            ds = str(r.get("dataset") or "")
+            if ds == "goit_oil_ngl":
+                emoji = "🛢️"
+                fuel_label = "Oil/NGL"
+            elif ds == "ggit_gas":
+                emoji = "🔥"
+                fuel_label = "Gas"
+            else:
+                emoji = "⛽"
+                fuel_label = str(r.get("fuel") or "Pipelines")
+
+            rgba = r.get("stroke_rgba") or [160, 160, 160, 170]
+
+            def _emit(path: list[list[float]]) -> None:
+                rows.append(
+                    {
+                        "category_label": "Pipelines (GEM)",
+                        "category_emoji": emoji,
+                        "subtype_line": "",
+                        "gem_id": r.get("project_id") or "",
+                        "hover_html": _to_hover(
+                            props,
+                            fuel_label=fuel_label,
+                            name_fallback=str(r.get("pipeline_name") or ""),
+                            status_fallback=str(r.get("status") or ""),
+                        ),
+                        "fuel": fuel_label,
+                        "status": r.get("status") or "",
+                        "name": r.get("pipeline_name") or "",
+                        "path": path,
+                        "stroke_color": rgba,
+                    }
+                )
+
+            if gtype == "LineString" and isinstance(coords, list):
+                path = [[float(pt[0]), float(pt[1])] for pt in coords if isinstance(pt, list) and len(pt) >= 2]
+                if len(path) >= 2:
+                    _emit(path)
+            elif gtype == "MultiLineString" and isinstance(coords, list):
+                for line in coords:
+                    if not isinstance(line, list):
+                        continue
+                    path = [[float(pt[0]), float(pt[1])] for pt in line if isinstance(pt, list) and len(pt) >= 2]
+                    if len(path) >= 2:
+                        _emit(path)
+
+        meta = {
+            "source": "supabase_rpc",
+            "bbox": {"min_lon": bbox[0], "min_lat": bbox[1], "max_lon": bbox[2], "max_lat": bbox[3]},
+            "dataset": dataset,
+            "rows_returned": len(raw),
+            "paths_drawn": len(rows),
+            "skipped_bad_geojson": skipped_bad_geojson,
+            "geom_type_counts": dict(geom_type_counts),
+        }
+        return {"rows": rows, "meta": meta}
+
+    def _load_gem_pipeline_paths_local() -> dict[str, Any]:
+        """
+        Fallback local loader (used when Supabase table/RPC is not available yet).
+        """
+        import json
+        from collections import Counter
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        sources = [
+            (
+                root
+                / "data/globalenergymonitor/GEM-GOIT-Oil-NGL-Pipelines-2025-03/GEM-GOIT-Oil-NGL-Pipelines-2025-03.geojson",
+                "Oil/NGL",
+                "🛢️",
+                [220, 38, 38, 170],
+            ),
+            (
+                root
+                / "data/globalenergymonitor/GEM-GGIT-Gas-Pipelines-2025-11/GEM-GGIT-Gas-Pipelines-2025-11.geojson",
+                "Gas",
+                "🔥",
+                [38, 110, 220, 170],
+            ),
+        ]
+        rows: list[dict[str, Any]] = []
+        meta: dict[str, Any] = {"source": "local_geojson", "files_found": 0, "features_total": 0}
+        geom_types = Counter()
+
+        def _coerce_path_line(coords: Any) -> list[list[float]] | None:
+            if not isinstance(coords, list) or not coords:
+                return None
+            out: list[list[float]] = []
+            for pt in coords:
+                if isinstance(pt, list) and len(pt) >= 2 and isinstance(pt[0], (int, float)) and isinstance(pt[1], (int, float)):
+                    out.append([float(pt[0]), float(pt[1])])
+            return out if len(out) >= 2 else None
+
+        for p, fuel_label, emoji, rgba in sources:
+            if not p.exists():
+                continue
+            meta["files_found"] += 1
+            with p.open("rb") as f:
+                data = json.load(f)
+            feats = data.get("features") or []
+            meta["features_total"] += int(len(feats))
+            for ft in feats:
+                g = ft.get("geometry") or {}
+                props = ft.get("properties") or {}
+                gtype = g.get("type")
+                geom_types[gtype] += 1
+                pid = props.get("ProjectID")
+                name = props.get("PipelineName") or props.get("SegmentName") or ""
+                status = props.get("Status") or ""
+                start = props.get("StartLocation") or ""
+                end = props.get("EndLocation") or ""
+                hover_html = "<br>".join([x for x in [f"<b>{name}</b>" if name else "", fuel_label, f"Status: {status}" if status else "", f"{start} → {end}".strip(" →") if start or end else ""] if x])
+
+                def _emit(path: list[list[float]]) -> None:
+                    rows.append(
+                        {
+                            "category_label": "Pipelines (GEM)",
+                            "category_emoji": emoji,
+                            "subtype_line": "",
+                            "gem_id": pid or "",
+                            "hover_html": hover_html,
+                            "fuel": fuel_label,
+                            "status": status,
+                            "name": name,
+                            "path": path,
+                            "stroke_color": rgba,
+                        }
+                    )
+
+                if gtype == "LineString":
+                    path = _coerce_path_line(g.get("coordinates"))
+                    if path:
+                        _emit(path)
+                elif gtype == "MultiLineString":
+                    for line in g.get("coordinates") or []:
+                        path = _coerce_path_line(line)
+                        if path:
+                            _emit(path)
+
+        meta["geometry_type_counts"] = dict(geom_types)
+        return {"rows": rows, "meta": meta}
+
     pairs = load_gem_all_source_sheet_pairs()
     if not pairs:
         st.warning(
@@ -3106,6 +3340,108 @@ def explore_gem_infrastructure_map() -> None:
     )
 
     regs = frozenset(region_sel) if apply_geo else frozenset()
+
+    show_pipelines = st.checkbox(
+        "Show GEM pipeline lines (gas + oil/NGL)",
+        value=True,
+        key="gem_map_show_pipelines",
+        help="Draws line geometry from local GeoJSONs under `data/globalenergymonitor/…`. Lines with missing geometry are skipped.",
+    )
+
+    show_subsea = st.checkbox(
+        "Show undersea internet cables (TeleGeography)",
+        value=False,
+        key="gem_map_show_subsea_cables",
+        help="Loads cable routes + landing points from Supabase (TeleGeography Submarine Cable Map; CC BY-NC-SA 3.0).",
+    )
+
+    @st.cache_data(ttl=3600, show_spinner="Loading undersea cable routes…")
+    def _load_subsea_cable_routes() -> list[dict[str, Any]]:
+        sb = supabase()
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            res = (
+                sb.table("subsea_cable_routes")
+                .select("cable_slug,color,path_coords")
+                .order("id")
+                .range(offset, offset + PAGE_SIZE - 1)
+                .execute()
+            )
+            batch = res.data or []
+            rows.extend(batch)
+            if len(batch) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+        return rows
+
+    @st.cache_data(ttl=3600, show_spinner="Loading undersea cable systems…")
+    def _load_subsea_cable_systems() -> dict[str, dict[str, Any]]:
+        sb = supabase()
+        rows = fetch_all_pages(
+            sb,
+            "subsea_cable_systems",
+            select="slug,name,rfs_year,length_km,owners,website",
+            order_by="slug",
+        )
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            slug = r.get("slug")
+            if isinstance(slug, str) and slug:
+                out[slug] = r
+        return out
+
+    @st.cache_data(ttl=3600, show_spinner="Loading undersea landing points…")
+    def _load_subsea_landing_points() -> list[dict[str, Any]]:
+        sb = supabase()
+        rows = fetch_all_pages(
+            sb,
+            "subsea_landing_points",
+            select="id,name,lon,lat,is_tbd",
+            order_by="name",
+        )
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                out.append(
+                    {
+                        "id": r.get("id"),
+                        "name": r.get("name"),
+                        "lon": float(r.get("lon")),
+                        "lat": float(r.get("lat")),
+                        "is_tbd": bool(r.get("is_tbd", False)),
+                    }
+                )
+            except Exception:
+                continue
+        return out
+
+    def _hex_to_rgba(s: Any, *, alpha: int = 170) -> list[int]:
+        if not isinstance(s, str):
+            return [140, 140, 140, alpha]
+        h = s.strip().lstrip("#")
+        if len(h) != 6:
+            return [140, 140, 140, alpha]
+        try:
+            r = int(h[0:2], 16)
+            g = int(h[2:4], 16)
+            b = int(h[4:6], 16)
+            return [r, g, b, alpha]
+        except Exception:
+            return [140, 140, 140, alpha]
+
+    pipe_dataset = st.selectbox(
+        "Pipeline dataset",
+        options=["All", "Gas (GGIT)", "Oil/NGL (GOIT)"],
+        index=0,
+        key="gem_map_pipeline_dataset",
+        help="Filters pipeline lines only (points are unaffected).",
+    )
+    ds_param = None
+    if pipe_dataset == "Gas (GGIT)":
+        ds_param = "ggit_gas"
+    elif pipe_dataset == "Oil/NGL (GOIT)":
+        ds_param = "goit_oil_ngl"
 
     def _one(pair: tuple[str, str]) -> list[dict[str, Any]]:
         fn, sn = pair
@@ -3219,6 +3555,158 @@ def explore_gem_infrastructure_map() -> None:
         "Dot **colour** = category; **brightness** shifts slightly when a subtype is detected."
     )
     layers: list[pdk.Layer] = []
+
+    if show_pipelines:
+        try:
+            pip = _load_gem_pipeline_paths_supabase(regs=regs, apply_geo=apply_geo, dataset=ds_param)
+        except Exception:
+            pip = _load_gem_pipeline_paths_local()
+        pipe_rows: list[dict[str, Any]] = list(pip.get("rows") or [])
+        pipe_meta: dict[str, Any] = dict(pip.get("meta") or {})
+        if regs and pipe_meta.get("source") == "local_geojson":
+            # Local fallback: apply region filter client-side.
+            pipe_rows = [
+                r
+                for r in pipe_rows
+                if any(point_in_regions(float(lat), float(lon), regs) for lon, lat in (r.get("path") or []))
+            ]
+        with st.expander("Pipeline line geometry (GEM) — coverage", expanded=False):
+            st.json({**pipe_meta, "paths_drawn_after_area_filter": len(pipe_rows)})
+        if pipe_rows:
+            layers.append(
+                pdk.Layer(
+                    "PathLayer",
+                    pipe_rows,
+                    get_path="path",
+                    get_color="stroke_color",
+                    width_scale=10,
+                    width_min_pixels=1,
+                    width_max_pixels=4,
+                    pickable=True,
+                    opacity=0.9,
+                )
+            )
+
+    if show_subsea:
+        systems = _load_subsea_cable_systems()
+        routes = _load_subsea_cable_routes()
+        landing = _load_subsea_landing_points()
+
+        cable_path_rows: list[dict[str, Any]] = []
+        for r in routes:
+            slug = r.get("cable_slug")
+            if not isinstance(slug, str) or not slug:
+                continue
+            sys_row = systems.get(slug, {})
+            name = sys_row.get("name") or slug
+            color = r.get("color")
+            rgba = _hex_to_rgba(color, alpha=170)
+            coords = r.get("path_coords")
+            if not isinstance(coords, list):
+                continue
+            for line in coords:
+                if not isinstance(line, list) or len(line) < 2:
+                    continue
+                path: list[list[float]] = []
+                for pt in line:
+                    if isinstance(pt, list) and len(pt) >= 2:
+                        lon, lat = pt[0], pt[1]
+                        if isinstance(lon, (int, float)) and isinstance(lat, (int, float)):
+                            path.append([float(lon), float(lat)])
+                if len(path) < 2:
+                    continue
+                hover_bits: list[str] = [f"<b>{name}</b>", f"Slug: {slug}"]
+                if sys_row.get("rfs_year"):
+                    hover_bits.append(f"RFS: {sys_row.get('rfs_year')}")
+                if sys_row.get("length_km"):
+                    hover_bits.append(f"Length: {sys_row.get('length_km')} km")
+                if sys_row.get("owners"):
+                    hover_bits.append(f"Owners: {sys_row.get('owners')}")
+                if sys_row.get("website"):
+                    hover_bits.append(f"Website: {sys_row.get('website')}")
+                cable_path_rows.append(
+                    {
+                        "category_label": "Undersea cables",
+                        "category_emoji": "🌐",
+                        "subtype_line": "",
+                        "gem_id": slug,
+                        "hover_html": "<br>".join([x for x in hover_bits if x]),
+                        "path": path,
+                        "stroke_color": rgba,
+                    }
+                )
+
+        if regs:
+            # Keep a cable segment if any vertex falls inside selected region bbox(es).
+            cable_path_rows = [
+                r
+                for r in cable_path_rows
+                if any(
+                    point_in_regions(float(lat), float(lon), regs)
+                    for lon, lat in (r.get("path") or [])
+                )
+            ]
+
+        with st.expander("Undersea cables (TeleGeography) — coverage", expanded=False):
+            st.json(
+                {
+                    "cable_systems": len(systems),
+                    "route_rows": len(routes),
+                    "path_segments_drawn_after_area_filter": len(cable_path_rows),
+                    "landing_points": len(landing),
+                    "license": "CC BY-NC-SA 3.0",
+                    "source": "TeleGeography Submarine Cable Map",
+                }
+            )
+
+        if cable_path_rows:
+            layers.append(
+                pdk.Layer(
+                    "PathLayer",
+                    cable_path_rows,
+                    get_path="path",
+                    get_color="stroke_color",
+                    width_scale=8,
+                    width_min_pixels=1,
+                    width_max_pixels=3,
+                    pickable=True,
+                    opacity=0.85,
+                )
+            )
+
+        lp_rows = landing
+        if regs:
+            lp_rows = [
+                r
+                for r in lp_rows
+                if point_in_regions(float(r["lat"]), float(r["lon"]), regs)
+            ]
+        if lp_rows:
+            landing_deck = [
+                {
+                    "category_label": "Cable landing points",
+                    "category_emoji": "📍",
+                    "subtype_line": "",
+                    "gem_id": r.get("id") or "",
+                    "hover_html": f"<b>{r.get('name') or ''}</b>",
+                    "lon": r["lon"],
+                    "lat": r["lat"],
+                    "is_tbd": bool(r.get("is_tbd", False)),
+                }
+                for r in lp_rows
+            ]
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    landing_deck,
+                    get_position=["lon", "lat"],
+                    get_fill_color=[10, 10, 10, 200],
+                    pickable=True,
+                    radius_min_pixels=2,
+                    radius_max_pixels=6,
+                )
+            )
+
     # Draw high-volume categories first (bottom); sparse categories last so they are not hidden under e.g. power.
     cats_layer_order = sorted(
         df_map["category_label"].unique(),
@@ -3260,6 +3748,14 @@ def explore_gem_infrastructure_map() -> None:
         height=580,
     )
     st.pydeck_chart(deck, width="stretch")
+
+    if show_subsea:
+        with st.expander("Undersea cables — attribution (required by license)", expanded=False):
+            st.markdown(
+                "Data source: **TeleGeography Submarine Cable Map** · License: **CC BY-NC-SA 3.0**. "
+                "Use is restricted to **non-commercial** contexts; if you redistribute derived data, "
+                "you must keep the same license and provide attribution."
+            )
 
 
 def explore_hs_lookup_tab() -> None:
@@ -4537,23 +5033,23 @@ def main() -> None:
     )
 
     try:
-        if section == "Prices over time":
+        if section == "Commodity prices (time series)":
             tab_prices()
-        elif section == "Who trades what":
+        elif section == "Trade by product (top countries)":
             tab_who_trades()
-        elif section == "Country profile":
+        elif section == "Country trade profile":
             tab_country_profile()
-        elif section == "Exporter & partners":
+        elif section == "Exporters: partners & products":
             tab_exporter_partners()
-        elif section == "Group dependencies":
+        elif section == "Group export exposure":
             tab_group_dependencies()
-        elif section == "Crop production":
+        elif section == "Crop production (by country)":
             tab_crop_rank()
-        elif section == "Pipeline status":
+        elif section == "Data refresh status":
             tab_pipeline()
-        elif section == "GEM infrastructure map":
+        elif section == "Infrastructure map (GEM assets)":
             explore_gem_infrastructure_map()
-        elif section == "Explore more":
+        elif section == "Data library (all tables)":
             tab_explore_more()
     except Exception as e:
         st.error(f"Query failed: {e}")

@@ -7,8 +7,40 @@ food security by country.
 **V1 scope:** Energy (crude, LNG, refined products) → Fertilizers (urea, ammonia,
 DAP/MAP) → Food crops (wheat, rice, corn, soybeans, cotton).
 
-**Architecture principle:** Pull scripts and loaders write to Supabase. The Streamlit
-app only ever reads from Supabase. No API calls from the UI.
+**Data is local now.** The hosted Supabase project is no longer reachable. A full
+export of every application table (CSV + schema, ~1.2 GB) lives in
+`~/Downloads/supabase-narrative-backup`. GEM oil and gas **pipeline line geometry**
+is read from GeoJSON downloaded under `data/globalenergymonitor/` (not PostGIS).
+Source files for loaders (BACI, JODI, USGS, CEPII, GEM workbooks) stay under `data/`.
+The Streamlit UI still talks PostgREST (no live EIA/FAO/etc. calls from the app); it
+now points at the local dump instead of the hosted project.
+
+---
+
+## Screenshots
+
+Streamlit explorer (`uv run streamlit run app/streamlit_app.py`) running against that
+local export. Pipeline routes on the map come from the downloaded GEM GeoJSON.
+
+**Infrastructure map (GEM plants + oil/gas pipelines, Middle East)**
+
+![GEM infrastructure map of the Middle East with plant sites and oil/gas pipeline lines](docs/screenshots/05-infrastructure-map.png)
+
+**Prices over time** (World Bank Pink Sheet)
+
+![Commodity price time series for corn and urea](docs/screenshots/01-commodity-prices.png)
+
+**Who trades what** (BACI bilateral trade — crude oil HS 270900, 2024)
+
+![Top crude oil exporters and importers in 2024](docs/screenshots/02-trade-by-product.png)
+
+**Crop production by country**
+
+![Bar chart of corn exports by country](docs/screenshots/03-crop-production.png)
+
+**Data refresh status**
+
+![Table of latest pipeline script runs](docs/screenshots/04-data-refresh-status.png)
 
 ---
 

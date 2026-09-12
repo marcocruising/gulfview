@@ -1,3 +1,9 @@
 title: Gulfview
 description: Hormuz supply chain explorer
 theme: jekyll-theme-primer
+baseurl: /gulfview
+plugins:
+  - jekyll-relative-links
+relative_links:
+  enabled: true
+  collections: true

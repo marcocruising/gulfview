@@ -15,7 +15,7 @@ Source files for loaders (BACI, JODI, USGS, CEPII, GEM workbooks) stay under `da
 The Streamlit UI still talks PostgREST (no live EIA/FAO/etc. calls from the app); it
 now points at the local dump instead of the hosted project.
 
-**Wiki:** [visual guide](docs/index.md) — map, trade, prices, crops, and the data dump, with screenshots first.
+**Wiki:** [visual guide](https://marcocruising.github.io/gulfview/) — map, trade, prices, crops, and the data dump, with screenshots first. Source: [docs/index.md](docs/index.md).
 
 ---
 
